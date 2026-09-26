@@ -13,6 +13,9 @@ load_dotenv()
 _HERE = Path(__file__).resolve().parent
 os.environ.setdefault("DATA_ROOT_DIRECTORY", str(_HERE / "data" / "cognee_data"))
 os.environ.setdefault("SYSTEM_ROOT_DIRECTORY", str(_HERE / "data" / "cognee_system"))
+# Cognee's session memory feeds earlier questions and answers back in as context, so one
+# wrong answer ("your name is Keith") keeps coming back. The profile and graph are the truth.
+os.environ.setdefault("CACHING", "false")
 
 import cognee  # noqa: E402  (must import after env setup)
 from cognee import SearchType  # noqa: E402
@@ -110,34 +113,6 @@ async def recall_raw(user_id: int | str, question: str, system_prompt: str | Non
     return _first_text(results)
 
 
-async def recall(user_id: int | str, question: str, system_prompt: str | None = None) -> str:
-    """Answer a question using only this user's memories. system_prompt replaces Cognee's
-    default answer instructions (used to pass the user's profile and reply style)."""
-    ds = dataset_for(user_id)
-    connecting = is_connecting(user_id)
-    note = "\n\n(New memories may take a few seconds to connect.)" if connecting else ""
-
-    try:
-        results = await cognee.search(
-            query_text=question,
-            query_type=SearchType.GRAPH_COMPLETION,
-            datasets=[ds],
-            **_search_kwargs(system_prompt),
-        )
-    except Exception as e:
-        log.info("search failed for %s: %s", ds, e)
-        if connecting:
-            return "I'm still connecting your new memories. Ask me again in a few seconds 💜"
-        if ds not in _known:
-            return "I don't have any memories from you yet. Text me something to remember 💜"
-        return "Sorry, I couldn't search your memories right now. Try again in a moment 💜"
-
-    answer = _first_text(results)
-    if not answer:
-        return "I couldn't find anything about that in your memories 💜" + note
-    return answer + note
-
-
 def _first_text(results) -> str:
     """Pull a plain text answer out of Cognee search results."""
     for r in results or []:
@@ -186,3 +161,19 @@ async def forget_text(user_id: int | str, text: str) -> int:
         except Exception as e:
             log.info("forget: delete failed (%s)", type(e).__name__)
     return removed
+
+
+async def context_for(user_id: int | str, question: str) -> str:
+    """What the graph knows that is relevant to the question, as text (no answer written).
+    The voice layer writes the answer from this."""
+    try:
+        results = await cognee.search(
+            query_text=question,
+            query_type=SearchType.GRAPH_COMPLETION,
+            datasets=[dataset_for(user_id)],
+            only_context=True,
+        )
+    except Exception as e:
+        log.info("context search failed for %s: %s", dataset_for(user_id), type(e).__name__)
+        return ""
+    return _first_text(results)

@@ -11,6 +11,12 @@ with `?` and it answers from your memories. Each user's memory is private.
 - `assistant.py`: classifies each message (question, schedule item, memory), answers
   schedule questions from the calendar plus Cognee, builds class reminder context.
 - `feeds.py`: Brightspace and Google Calendar iCal sync (now and every 3 hours).
+- `voice.py`: Violet's voice. Every reply (saves, answers, reminders, confirmations, errors)
+  goes through it with one shared system prompt (rules plus few-shot examples, the user's
+  profile and reply style, their recent replies). Code keeps emoji occasional, trims repeated
+  offers and stock openers, and strips markdown, em dashes and mentions of internals. Lists
+  where every line matters (/week, items added from a file, /me) are attached word for word
+  under a voiced lead-in. Optional `VOICE_MODEL` in `.env` (defaults to `LLM_MODEL`).
 - `selfmodel.py`: the user's profile (identity, academics, goals, people, preferences,
   patterns). Each fact has source, stated or inferred, confidence, first seen and last
   confirmed. Mirrored into Cognee as one "me" document tagged `node_set=["core_profile"]`.
@@ -92,6 +98,9 @@ previews what would fire at that moment.
   answered from the profile first, then Cognee.
 - Corrections ("I am X", "my name is X", "actually ...", "no, ...") update the profile,
   save the fix to Cognee and confirm.
+- Saves reply first (the acknowledgment is written in the same call as the classification)
+  and store in the background, so a graph build in progress never holds up a reply.
+- Cognee's session memory is turned off (`CACHING=false`): it fed old answers back in.
 - Messages from one user that arrive within 3 seconds are joined, so a long paste that
   Telegram splits is handled as one message (every text reply waits that long).
 

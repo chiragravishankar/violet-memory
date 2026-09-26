@@ -2,6 +2,7 @@
 No channel code here: bot.py downloads the file and sends the replies."""
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 import brain
@@ -23,74 +24,95 @@ def _context(file_name: str, caption: str | None) -> str:
     return ", ".join(parts)
 
 
-async def process_file(user_id, path: Path, file_name: str, caption: str | None) -> str:
-    """Extract text, save it to memory and add schedule items. Returns the reply text.
+@dataclass
+class Draft:
+    """What to tell the user: text for the voice layer, plus an optional list shown word for word."""
+    text: str
+    attach: str | None = None
+    kind: str = "info"
 
-    Call brain.connect(user_id) afterwards (in the background) to build the graph.
-    """
+
+async def process_file(user_id, path: Path, file_name: str, caption: str | None) -> Draft:
+    """Extract text, save it to memory and add schedule items (or seed the profile from a
+    resume). Call brain.connect(user_id) afterwards (in the background) to build the graph."""
     extracted = await docs.extract(path)
     # A short caption ("OM syllabus") names the file; a sentence doesn't.
     name = caption if caption and len(caption.split()) <= 4 else file_name
     if not extracted.text.strip():
-        return f"I couldn't find any text in {name} 💜"
+        return Draft(f"Couldn't find any text in {name}. Ask for a clearer copy or the text itself.", kind="error")
 
     await brain.save(user_id, brain.document_memory(file_name, caption, extracted.text), kind="document")
-    pages = f" ({_plural(extracted.pages, 'page')})" if extracted.pages else ""
+    pages = f", {_plural(extracted.pages, 'page')}" if extracted.pages else ""
 
     if await selfmodel.is_resume(extracted.text, caption, file_name):
         added = await selfmodel.seed_from_resume(user_id, extracted.text)
-        lines = [f"📄 Read {name}{pages}. Saved to memory."]
-        if added:
-            lines.append("🪞 Added to your profile:")
-            lines += [f"• {f['text']}" for f in added[:10]]
-            if len(added) > 10:
-                lines.append(f"...and {len(added) - 10} more.")
-            lines.append("Send /me to see it all, or /me edit to fix anything.")
-        else:
-            lines.append("It looks like a resume, but I didn't find anything new for your profile.")
-        return "\n".join(lines)
+        if not added:
+            return Draft(f"Read his resume ({name}{pages}). Nothing new about him in it.", kind="save")
+        shown = [f"• {f['text']}" for f in added[:10]] + ([f"...and {len(added) - 10} more"] if len(added) > 10 else [])
+        return Draft(f"Read his resume ({name}{pages}) and picked up {len(added)} things about him (listed below). "
+                     "He can see everything with /me and fix anything with /me edit.",
+                     attach="\n".join(shown), kind="save")
 
     items = await schedule.extract(extracted.text, _context(file_name, caption))
     result = schedule.add_items(user_id, items, source="file", label=name)
-
-    lines = [f"📄 Read {name}{pages}. Saved to memory."]
-    lines += summarize(result)
+    facts = [f"Read {name}{pages}, and will remember what's in it."]
     if result.added:
-        lines.append("Reply /undo to remove these.")
-    return "\n".join(lines)
+        facts.append(f"Added {_count_words(result)} to his calendar (listed below). /undo removes them.")
+    elif not result.duplicates:
+        facts.append("No dated deadlines or class times in it.")
+    if result.duplicates:
+        facts.append(f"Skipped {result.duplicates} already in his calendar.")
+    if result.past:
+        facts.append(f"Skipped {result.past} with dates already past.")
+    return Draft(" ".join(facts), attach="\n".join(item_lines(result)) or None, kind="save")
 
 
-async def process_chat(user_id, text: str) -> str | None:
-    """Add deadlines or classes from a chat message. Returns the reply, or None if none were found."""
-    items = await schedule.extract(text, "a chat message from the user", allow_relative=True)
+async def process_chat(user_id, text: str) -> Draft | None:
+    """Add deadlines or classes from a chat message. None if the message had none."""
+    courses = sorted({i.course for i in schedule.existing_items(user_id) if i.course})
+    projects = [f["text"] for f in selfmodel.get_profile(user_id)["academics"]][:8]
+    context = ("a chat message from the user. Their courses: " + "; ".join(courses)
+               + ". What they told you about their coursework (use it to set the course, e.g. a group "
+                 "project named here belongs to that course): " + "; ".join(projects))
+    items = await schedule.extract(text, context, allow_relative=True)
     if not items:
         return None
     result = schedule.add_items(user_id, items, source="chat", label=text[:60])
     if not result.added:
-        return "That's already in your calendar 💜" if result.duplicates else None
-    return "\n".join(summarize(result, skipped_lines=False))
+        if not result.duplicates:
+            return None
+        return Draft("That's already in his calendar, nothing new added.", kind="schedule")
+    facts = ["Added to his calendar: " + "; ".join(item_lines(result, numbered=False)) + "."]
+    for it in result.added:
+        if it.kind == "class":
+            facts.append("Class reminders go out 30 minutes before each meeting.")
+        elif it.kind == "exam":
+            facts.append("Exam reminders go out 1 week, 3 days, 1 day and 3 hours before.")
+        else:
+            facts.append("Reminders go out 3 days, 1 day and 3 hours before.")
+        break
+    facts.append("If it's for a course with teammates he's told you about, you can mention them.")
+    return Draft(" ".join(facts), kind="schedule")
 
 
-def summarize(result: schedule.AddResult, skipped_lines: bool = True) -> list[str]:
+def _count_words(result: schedule.AddResult) -> str:
     deadlines = [i for i in result.added if i.kind != "class"]
-    classes = [i for i in result.added if i.kind == "class"]
-    one_course = len({(i.course or "").lower() for i in deadlines}) <= 1
-
-    lines = []
+    groups = schedule.fmt_class_group([i for i in result.added if i.kind == "class"])
+    parts = []
     if deadlines:
-        deadlines.sort(key=schedule.due_datetime)
-        lines.append(f"📅 Added {_plural(len(deadlines), 'deadline')}:")
-        for n, it in enumerate(deadlines, 1):
-            title = it.title if one_course else schedule.label(it)
-            lines.append(f"{n}. {title}, {schedule.fmt_due(it)}")
-    if classes:
-        groups = schedule.fmt_class_group(classes)
-        lines.append(f"🗓 Added {_plural(len(groups), 'weekly class', 'weekly classes')}:")
-        lines += groups
-    if not result.added and skipped_lines and not result.duplicates:
-        lines.append("No dated deadlines or class times found.")
-    if skipped_lines and result.duplicates:
-        lines.append(f"Skipped {result.duplicates} already in your calendar.")
-    if skipped_lines and result.past:
-        lines.append(f"Skipped {result.past} with dates already past.")
+        parts.append(_plural(len(deadlines), "deadline"))
+    if groups:
+        parts.append(_plural(len(groups), "weekly class", "weekly classes"))
+    return " and ".join(parts)
+
+
+def item_lines(result: schedule.AddResult, numbered: bool = True) -> list[str]:
+    """One line per added deadline or weekly class, in date order."""
+    deadlines = sorted((i for i in result.added if i.kind != "class"), key=schedule.due_datetime)
+    one_course = len({(i.course or "").lower() for i in deadlines}) <= 1
+    lines = []
+    for n, it in enumerate(deadlines, 1):
+        title = it.title if one_course and numbered else schedule.label(it)
+        lines.append(f"{n}. {title}, {schedule.fmt_due(it)}" if numbered else f"{title}, due {schedule.fmt_due(it)}")
+    lines += schedule.fmt_class_group([i for i in result.added if i.kind == "class"])
     return lines

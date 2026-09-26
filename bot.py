@@ -19,30 +19,21 @@ import ingest
 import onboarding
 import schedule
 import selfmodel
+import voice
 
 logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
-WELCOME = (
-    "Hi, I'm Violet Memory 💜 Text me anything to remember it: people you meet, "
-    "events, ideas, deadlines. Ask anything ending with ? and I'll recall it."
+# Reference list shown word for word under /help (not a reply; the reply is voiced).
+COMMANDS = (
+    "/week  your next 7 days\n"
+    "/undo  remove what your last file added\n"
+    "/me  what I know about you (/me setup, /me edit, /me reflect)\n"
+    "/forget <text>  make me forget something\n"
+    "/demo_time 2026-09-29 13:30  preview reminders at a moment"
 )
-HELP = (
-    WELCOME
-    + "\n\nSend me a PDF, Word file, text file or photo (like a syllabus or a class "
-    "schedule screenshot) and I'll save it and add its deadlines. Add a caption like "
-    "\"OM syllabus\" so I know what it is.\n\n"
-    "/week shows your next 7 days.\n/undo removes the deadlines from your last file.\n"
-    "/demo_time 2026-09-29 13:30 shows the reminders that would fire at that time.\n\n"
-    "/me shows what I know about you. /me setup to tell me about yourself, /me edit to fix "
-    "something, /me reflect for a quick check-in. /forget <text> removes something."
-)
-FILE_TYPES = "I can read PDF, Word (.docx), .txt, .md and photos for now 💜"
-TOO_BIG = "That file is over 20 MB, which is more than Telegram lets me download. Could you send a smaller version? 💜"
 FILES_DIR = Path(__file__).resolve().parent / "data" / "files"
-SAVED = "💜 Saved"
-TEXT_ONLY = "I can only read text for now 💜"
 
 # ---------- SQLite message log ----------
 
@@ -91,9 +82,26 @@ def last_reply(user_id) -> str | None:
     return row[0] if row else None
 
 
+def recent_replies(user_id, n: int = 5) -> list[str]:
+    rows = _db.execute(
+        "SELECT text FROM messages WHERE user_id = ? AND direction = 'out' ORDER BY id DESC LIMIT ?", (int(user_id), n)
+    ).fetchall()
+    return [r[0] for r in reversed(rows) if r[0]]
+
+
 async def reply(update: Update, text: str) -> None:
+    """Send text that is already in Violet's voice."""
     await update.effective_message.reply_text(text)
     log_message("out", update, text)
+
+
+async def speak(update: Update, draft: str, kind: str = "info", user_message: str | None = None,
+                attach: str | None = None) -> None:
+    """Every reply goes through the voice layer: the draft says what to get across."""
+    user_id = update.effective_user.id
+    text = await voice.say(user_id, draft, kind=kind, user_message=user_message, attach=attach,
+                           recent=recent_replies(user_id))
+    await reply(update, text)
 
 
 def inbound_text(update: Update) -> str:
@@ -116,27 +124,39 @@ def _kind(msg) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
-    await reply(update, WELCOME)
+    await speak(update, "First hello. You're Violet: he can text you anything to keep (people he meets, "
+                        "events, ideas, deadlines), ask you anything about it, and send files like a syllabus. "
+                        "Two short sentences.", kind="info")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
-    await reply(update, HELP)
+    await speak(update, "Quick how-to: text you anything to keep it, ask anything in plain words, send a PDF, "
+                        "Word file or photo (a caption like 'OM syllabus' helps). Commands are listed below.",
+                kind="info", attach=COMMANDS)
 
 
 async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
-    await reply(update, schedule.week_view(update.effective_user.id))
+    user_id = update.effective_user.id
+    now = datetime.now(schedule.TZ)
+    lines = schedule.agenda_lines(user_id, now.date(), now.date() + timedelta(days=6), now)
+    if not lines:
+        await speak(update, "Nothing on his calendar for the next 7 days.", kind="answer", user_message="/week")
+        return
+    await speak(update, "His next 7 days are below. Lead in with a few words, pointing out what stands out "
+                        "(an exam, a busy day) if anything.", kind="answer", user_message="/week", attach="\n".join(lines))
 
 
 async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
     undone = schedule.undo_last_file(update.effective_user.id)
     if undone is None:
-        await reply(update, "There's nothing from a file to undo 💜")
+        await speak(update, "Nothing from a file to undo.", kind="confirmation", user_message="/undo")
         return
     label, count = undone
-    await reply(update, f"Removed {count} item{'s' if count != 1 else ''} added from {label} 💜")
+    await speak(update, f"Removed the {count} calendar item{'s' if count != 1 else ''} that came from {label}.",
+                kind="confirmation", user_message="/undo")
 
 
 # Telegram splits long pastes into several messages. Messages from one user that arrive
@@ -180,8 +200,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
     # Conversations in progress about the profile take the message first.
     if onboarding.is_active(user_id):
         set_classification(rows, "onboarding")
-        answer, finished = await _with_typing(update, context, onboarding.handle(user_id, text))
-        await reply(update, answer)
+        draft, attach, finished = await _with_typing(update, context, onboarding.handle(user_id, text))
+        await speak(update, draft, kind="question", user_message=text, attach=attach)
         if finished:
             context.application.create_task(sync_profile(user_id))
         return
@@ -189,20 +209,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
     if m.get("awaiting_edit"):
         selfmodel.set_meta(user_id, awaiting_edit=False)
         set_classification(rows, "profile_edit")
-        await reply(update, await _with_typing(update, context, _apply_edit(user_id, text)))
+        await speak(update, await _with_typing(update, context, _apply_edit(user_id, text)),
+                    kind="confirmation", user_message=text)
         return
     if m.get("awaiting_answer") and selfmodel.next_question(user_id):
         set_classification(rows, "reflection_answer")
-        await reply(update, await _reflection_reply(update, context, user_id, text))
+        await speak(update, await _reflection_reply(update, context, user_id, text), kind="confirmation", user_message=text)
         return
 
-    c = await assistant.classify(text)
+    recent = recent_replies(user_id)
+    c = await assistant.classify(text, user_id=user_id, recent=recent)
     label = c.type + ("+schedule" if c.about_schedule else "") + ("+about_user" if c.about_user else "")
     log.info("classified %r as %s", text[:80], label)
     set_classification(rows, label)
 
     if c.type == assistant.CORRECTION:
-        answer = await _with_typing(update, context, assistant.correct(user_id, text, last_reply(user_id)))
+        answer = await _with_typing(update, context, assistant.correct(user_id, text, last_reply(user_id), recent))
         await reply(update, answer)
         context.application.create_task(brain.connect(user_id), update=update)
         context.application.create_task(sync_profile(user_id))
@@ -213,28 +235,45 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
 
     if c.type == assistant.QUESTION:
         answer = await _with_typing(
-            update, context, assistant.answer(user_id, text, c.about_schedule, about_user=c.about_user)
+            update, context, assistant.answer(user_id, text, c.about_schedule, about_user=c.about_user, recent=recent)
         )
         await reply(update, answer)
         return
 
-    try:
-        await brain.save(user_id, text)
-    except Exception:
-        log.exception("save failed")
-        await reply(update, "Sorry, I couldn't save that. Please try again 💜")
-        return
-    context.application.create_task(brain.connect(user_id), update=update)
+    # Reply first; the save runs in the background. cognee.add waits for any graph build
+    # already running on this dataset, which could hold the reply up for many seconds.
+    context.application.create_task(_remember(user_id, text))
 
     if c.type == assistant.SCHEDULE:
         try:
-            note = await _with_typing(update, context, ingest.process_chat(user_id, text))
+            draft = await _with_typing(update, context, ingest.process_chat(user_id, text))
         except Exception:
             log.exception("chat schedule extraction failed")
-            note = None
-        await reply(update, note or SAVED)
+            draft = None
+        if draft:
+            await speak(update, draft.text, kind=draft.kind, user_message=text)
+        else:
+            await speak(update, "Kept it, but there was no clear date or time to put on his calendar. "
+                                "Ask when, if it matters.", kind="save", user_message=text)
         return
-    await reply(update, SAVED)
+    if c.ack:
+        await reply(update, c.ack)  # written in the same call as the classification
+    else:
+        await speak(update, "Kept it. Acknowledge the specific thing.", kind="save", user_message=text)
+
+
+async def _remember(user_id, text: str) -> None:
+    """Save a message to memory (retry once), then connect it into the graph."""
+    for attempt in (1, 2):
+        try:
+            await brain.save(user_id, text)
+            break
+        except Exception as e:
+            log.warning("save failed (attempt %d, %s)", attempt, type(e).__name__)
+            if attempt == 2:
+                return
+            await asyncio.sleep(5)
+    await brain.connect(user_id)
 
 
 async def _learn(user_id, text: str) -> None:
@@ -256,28 +295,28 @@ async def sync_profile(user_id) -> None:
 async def _apply_edit(user_id, instruction: str) -> str:
     changes = await selfmodel.edit(user_id, instruction)
     if not changes:
-        return "I couldn't tell what to change. Try something like: /me edit I'm in the MS MOT program, not MBA 💜"
+        return ("Couldn't tell what to change. Give an example like: /me edit I'm in the MS MOT program, not MBA.")
     asyncio.get_running_loop().create_task(sync_profile(user_id))
-    return "Done 💜\n" + "\n".join(changes)
+    return "Changed: " + "; ".join(changes)
 
 
 async def _reflection_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id, text: str) -> str:
     q = selfmodel.next_question(user_id)
     if q is None:
         selfmodel.set_meta(user_id, awaiting_answer=False)
-        return "Thanks 💜"
+        return "Thanks for answering."
     outcome, fact = selfmodel.answer_question(user_id, text)
     if outcome == "confirmed":
-        head = "Thanks, noted 💜"
+        head = "He confirmed it; you'll treat it as a fact now."
     elif outcome == "deleted":
-        head = "Got it, I've dropped that 💜"
+        head = "He said no; you dropped it."
     else:
         changes = await _with_typing(update, context, selfmodel.edit(user_id, f'About "{q["question"]}": {text}'))
-        head = ("Thanks, updated 💜\n" + "\n".join(changes)) if changes else "Thanks 💜"
+        head = ("Updated: " + "; ".join(changes)) if changes else "Took his answer on board."
     context.application.create_task(sync_profile(user_id))
     nxt = selfmodel.next_question(user_id)
     if nxt:
-        return f"{head}\n\n{nxt['question']}"
+        return f"{head} Then ask exactly this: {nxt['question']}"
     selfmodel.set_meta(user_id, awaiting_answer=False)
     return head
 
@@ -288,19 +327,30 @@ async def me_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     sub = (context.args[0].lower() if context.args else "")
     rest = " ".join(context.args[1:]).strip()
+    said = inbound_text(update)
     if sub == "setup":
-        await reply(update, onboarding.start(user_id))
+        draft, attach = onboarding.start(user_id)
+        await speak(update, draft, kind="question", user_message=said, attach=attach)
     elif sub == "edit":
         if rest:
-            await reply(update, await _with_typing(update, context, _apply_edit(user_id, rest)))
+            await speak(update, await _with_typing(update, context, _apply_edit(user_id, rest)),
+                        kind="confirmation", user_message=said)
         else:
             selfmodel.set_meta(user_id, awaiting_edit=True)
-            await reply(update, "What should I change? For example: my career goal is product management, not consulting.")
+            await speak(update, "Ask what he wants changed about him, with an example like: my career goal is "
+                                "product management, not consulting.", kind="question", user_message=said)
     elif sub == "reflect":
-        await reply(update, await _with_typing(update, context, run_reflection(user_id)))
+        draft, attach = await _with_typing(update, context, run_reflection(user_id))
+        await speak(update, draft, kind="question", user_message=said, attach=attach)
     else:
         shown = selfmodel.format_profile(user_id)
-        await reply(update, shown or "I don't know much about you yet. Send /me setup and I'll ask a few quick questions 💜")
+        if not shown:
+            await speak(update, "You don't know much about him yet. Suggest /me setup for a few quick questions.",
+                        kind="info", user_message=said)
+        else:
+            await speak(update, "Here's everything you know about him (below). Lead in with a few words; mention "
+                                "/me edit to fix anything.", kind="info", user_message=said,
+                        attach=shown.split("\n", 2)[-1].strip())
 
 
 async def forget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -308,20 +358,18 @@ async def forget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user_id = update.effective_user.id
     text = " ".join(context.args).strip()
     if not text:
-        await reply(update, "Tell me what to forget, like: /forget Sam")
+        await speak(update, "Ask what to forget, with an example: /forget Sam", kind="question", user_message="/forget")
         return
     removed = selfmodel.forget_facts(user_id, text)
     memories = await _with_typing(update, context, brain.forget_text(user_id, text))
     context.application.create_task(sync_profile(user_id))
     if not removed and not memories:
-        await reply(update, f"I couldn't find anything about \"{text}\" to forget 💜")
+        await speak(update, f'Found nothing about "{text}" to forget.', kind="confirmation", user_message=f"/forget {text}")
         return
-    parts = []
-    if removed:
-        parts.append(f"{len(removed)} profile fact{'s' if len(removed) != 1 else ''}")
-    if memories:
-        parts.append(f"{memories} saved message{'s' if memories != 1 else ''}")
-    await reply(update, f"Forgotten: {' and '.join(parts)} about \"{text}\" 💜")
+    what = [f["text"] for f in removed]
+    extra = f" Also dropped {memories} message{'s' if memories != 1 else ''} he'd sent that mentioned it." if memories else ""
+    await speak(update, f'Forgot what you knew about "{text}": {"; ".join(what) or "nothing else"}.{extra}',
+                kind="confirmation", user_message=f"/forget {text}")
 
 
 def _recent_messages(user_id, days: int = 7) -> list[str]:
@@ -334,20 +382,20 @@ def _recent_messages(user_id, days: int = 7) -> list[str]:
     return [f"[{c or 'message'}] {t}" for t, c in rows if t]
 
 
-async def run_reflection(user_id) -> str:
-    """Review the week, update patterns, and start asking up to 2 confirmation questions."""
+async def run_reflection(user_id) -> tuple[str, str | None]:
+    """Review the week, update patterns, and start asking up to 2 confirmation questions.
+    Returns a draft for the voice layer and the patterns to show below it."""
     today = datetime.now(schedule.TZ).date()
     agenda = "\n".join(schedule.agenda_lines(user_id, today - timedelta(days=7), today + timedelta(days=7)))
     questions = await selfmodel.reflect(user_id, _recent_messages(user_id), agenda)
     asyncio.get_running_loop().create_task(sync_profile(user_id))
-    patterns = [f for f in selfmodel.get_profile(user_id)["patterns"]]
-    head = "🪞 Weekly check-in done."
-    if patterns:
-        head += " Patterns I see:\n" + "\n".join(f"• {f['text']}" for f in patterns[-4:])
+    patterns = [f["text"] for f in selfmodel.get_profile(user_id)["patterns"]][-4:]
+    draft = "Weekly check-in: you looked back at his week."
+    draft += " Patterns you noticed are listed below." if patterns else " Nothing new stood out."
     if questions:
         selfmodel.set_meta(user_id, awaiting_answer=True)
-        return f"{head}\n\nQuick question: {questions[0]['question']}"
-    return head
+        draft += f" Then ask exactly this: {questions[0]['question']}"
+    return draft, "\n".join(patterns) or None
 
 
 async def demo_time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -356,7 +404,7 @@ async def demo_time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         at = datetime.strptime(" ".join(context.args[:2]), "%Y-%m-%d %H:%M").replace(tzinfo=schedule.TZ)
     except ValueError:
-        await reply(update, "Try it like this: /demo_time 2026-09-29 13:30")
+        await speak(update, "Show the format: /demo_time 2026-09-29 13:30", kind="info", user_message=inbound_text(update))
         return
     await reply(update, await _with_typing(update, context, demo_time(update.effective_user.id, at)))
 
@@ -365,7 +413,7 @@ async def demo_time(user_id, at: datetime) -> str:
     head = f"🕒 Pretending it's {schedule.fmt_day(at.date())}, {schedule.fmt_time(at.time())}"
     due = schedule.preview_reminders(user_id, at)
     if not due:
-        return head + "\n\nNo reminders at that time 💜"
+        return head + "\n\n" + await voice.say(user_id, "No reminders go out at that moment.", kind="info")
     texts = [await assistant.reminder_message(user_id, it, lead, at) for it, lead in due]
     return head + "\n\n" + "\n\n".join(texts)
 
@@ -382,10 +430,12 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not ext and (msg.document.mime_type or "").startswith("image/"):
             file_name += "." + msg.document.mime_type.split("/")[1]
         if ext == ".doc":
-            await reply(update, "I can't read old .doc files. Could you save it as .docx and send it again? 💜")
+            await speak(update, "Can't read old .doc files. Ask him to save it as .docx and resend.", kind="error",
+                        user_message=inbound_text(update))
             return
         if not docs.is_supported(file_name):
-            await reply(update, FILE_TYPES)
+            await speak(update, "Can only read PDF, Word (.docx), .txt, .md and photos for now.", kind="error",
+                        user_message=inbound_text(update))
             return
     else:
         tg_file = msg.photo[-1]  # largest size
@@ -393,7 +443,8 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         file_name = f"photo_{msg.date:%Y%m%d_%H%M%S}.jpg"
 
     if size and size > docs.MAX_BYTES:
-        await reply(update, TOO_BIG)
+        await speak(update, "That file is over 20 MB, more than Telegram lets you download. Ask for a smaller version.",
+                    kind="error", user_message=inbound_text(update))
         return
 
     await update.effective_chat.send_action(ChatAction.TYPING)
@@ -405,23 +456,25 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await f.download_to_drive(path)
     except Exception:
         log.exception("download failed")
-        await reply(update, "Sorry, I couldn't download that file. Please try again 💜")
+        await speak(update, "Couldn't download that file. Ask him to try again.", kind="error",
+                    user_message=inbound_text(update))
         return
 
     caption = (msg.caption or "").strip() or None
     try:
-        summary = await _with_typing(update, context, ingest.process_file(user_id, path, file_name, caption))
+        draft = await _with_typing(update, context, ingest.process_file(user_id, path, file_name, caption))
     except Exception:
         log.exception("file processing failed")
-        await reply(update, "Sorry, I couldn't read that file. Please try again 💜")
+        await speak(update, "Couldn't read that file. Ask him to try again.", kind="error", user_message=inbound_text(update))
         return
-    await reply(update, summary)
+    await speak(update, draft.text, kind=draft.kind, user_message=inbound_text(update), attach=draft.attach)
     context.application.create_task(brain.connect(user_id), update=update)
 
 
 async def on_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
-    await reply(update, TEXT_ONLY)
+    await speak(update, "You can only read text, files and photos for now, not this kind of message.", kind="error",
+                user_message=inbound_text(update))
 
 
 async def _with_typing(update: Update, context: ContextTypes.DEFAULT_TYPE, coro):
@@ -443,7 +496,7 @@ async def send_reminders(app: Application) -> None:
             schedule.ensure_class_reminders()
             now = datetime.now(schedule.TZ)
             for user_id, item, lead in schedule.pop_due_reminders(now, quiet_until=selfmodel.quiet_until):
-                text = await assistant.reminder_message(user_id, item, lead, now)
+                text = await assistant.reminder_message(user_id, item, lead, now, recent_replies(user_id))
                 await app.bot.send_message(chat_id=int(user_id), text=text)
                 log_raw("out", int(user_id), int(user_id), text)
         except Exception:
@@ -473,7 +526,8 @@ async def profile_loop(app: Application) -> None:
                 if not user_id.isdigit() or selfmodel.meta(user_id).get("last_reflection") == now.date().isoformat():
                     continue
                 try:
-                    text = await run_reflection(user_id)
+                    draft, attach = await run_reflection(user_id)
+                    text = await voice.say(user_id, draft, kind="question", attach=attach, recent=recent_replies(user_id))
                     await app.bot.send_message(chat_id=int(user_id), text=text)
                     log_raw("out", int(user_id), int(user_id), text)
                 except Exception as e:
@@ -491,7 +545,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await reply(update, "Oops, something went wrong. Please try again 💜")
+            await speak(update, "Something went wrong on your side. Ask him to try again.", kind="error")
         except Exception:
             pass
 

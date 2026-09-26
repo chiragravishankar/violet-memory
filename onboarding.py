@@ -35,43 +35,50 @@ def _ask(step: int) -> str:
     return f"({step + 1}/{len(QUESTIONS)}) {QUESTIONS[step]}"
 
 
-def start(user_id) -> str:
+# Each function returns a draft for the voice layer: (text, list shown word for word or None).
+
+
+def start(user_id) -> tuple[str, str | None]:
     st = _state(user_id)
     if st["status"] == "paused" and st["step"] < len(QUESTIONS):
         _set(user_id, status="active")
-        return "Welcome back 💜 Picking up where we left off.\n\n" + _ask(st["step"])
+        return f"Welcome him back and pick up the setup where you left off. Ask exactly this next: {_ask(st['step'])}", None
     _set(user_id, status="active", step=0)
-    return (
-        "Let's get to know each other 💜 A few quick questions. "
-        'Type "skip" to skip one, or "later" to stop and finish another time.\n\n' + _ask(0)
-    )
+    return ("Start a quick getting-to-know-you setup: a few questions, one at a time. He can say "
+            f'"skip" for any question, or "later" to finish another time. Ask exactly this first: {_ask(0)}'), None
 
 
-def _summary_prompt(user_id) -> str:
+def _confirm(user_id, lead: str) -> tuple[str, str | None]:
     summary = selfmodel.profile_summary(user_id) or "Nothing yet."
-    return f"Here's what I've got:\n\n{summary}\n\nDoes this look right? Reply yes, or tell me what to change."
+    return (f"{lead} Show what you've got about him (below) and ask him to reply yes if it's right, "
+            "or tell you what to change."), summary
 
 
-async def handle(user_id, text: str) -> tuple[str, bool]:
-    """Handle a reply during onboarding. Returns (reply, finished)."""
+async def handle(user_id, text: str) -> tuple[str, str | None, bool]:
+    """Handle a reply during onboarding. Returns (draft, attach, finished)."""
     st = _state(user_id)
     if st["status"] == "confirming":
         if YES.match(text):
             _set(user_id, status="done")
-            return "Perfect, you're all set 💜 I'll keep learning as we talk. Send /me any time to see or change this.", True
+            return ("Setup's done. You'll keep learning as you talk; /me shows what you know and lets him "
+                    "change it."), None, True
         changes = await selfmodel.edit(user_id, text)
-        done = "\n".join(changes) if changes else "I couldn't tell what to change, could you say it another way?"
-        return f"{done}\n\n{_summary_prompt(user_id)}", False
+        lead = ("Updated: " + "; ".join(changes) + ".") if changes else "Couldn't tell what to change, ask him to say it another way."
+        draft, attach = _confirm(user_id, lead)
+        return draft, attach, False
 
     step = st["step"]
     if LATER.match(text):
         _set(user_id, status="paused")
-        return "No problem. Send /me setup any time and I'll pick up where we left off 💜", False
-    if not SKIP.match(text):
+        return "No problem, pause the setup. /me setup picks it up where you left off.", None, False
+    skipped = bool(SKIP.match(text))
+    if not skipped:
         await selfmodel.extract_onboarding(user_id, QUESTIONS[step], text)
     step += 1
+    ack = "He skipped that one." if skipped else "Acknowledge his answer in a few words, referring to what he said."
     if step < len(QUESTIONS):
         _set(user_id, step=step)
-        return "Got it 💜\n\n" + _ask(step), False
+        return f"{ack} Then ask exactly this next: {_ask(step)}", None, False
     _set(user_id, step=step, status="confirming")
-    return _summary_prompt(user_id), False
+    draft, attach = _confirm(user_id, ack)
+    return draft, attach, False

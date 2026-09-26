@@ -756,6 +756,16 @@ def reminder_text(it: Item, lead: str) -> str:
     return f"⏰ {label(it)} {verb} {when}: {fmt_due(it)}.{lockdown}"
 
 
+def upcoming_for_course(user_id, course: str, after: datetime, limit: int = 3) -> list[Item]:
+    """The next few deadlines for this course after the given time, soonest first."""
+    items = [
+        i for i in existing_items(user_id)
+        if i.kind in DEADLINE_KINDS and i.course and course and _courses_match(i.course, course)
+        and due_datetime(i) > after
+    ]
+    return sorted(items, key=due_datetime)[:limit]
+
+
 def next_due_for_course(user_id, course: str, after: datetime) -> Item | None:
     """The next deadline for this course after the given time."""
     items = [
@@ -836,7 +846,7 @@ def week_view(user_id, days: int = 7, now: datetime | None = None) -> str:
     now = now or datetime.now(TZ)
     lines = agenda_lines(user_id, now.date(), now.date() + timedelta(days=days - 1), now)
     if not lines:
-        return f"Nothing on your calendar for the next {days} days 💜"
+        return f"Nothing on the calendar for the next {days} days."
     return f"📅 Your next {days} days\n\n" + "\n".join(lines)
 
 

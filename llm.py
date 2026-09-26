@@ -32,16 +32,17 @@ def client() -> AsyncOpenAI:
     return _client
 
 
-async def chat(messages: list, json_mode: bool = False, model_name: str | None = None) -> str:
+async def chat(messages: list, json_mode: bool = False, model_name: str | None = None,
+               temperature: float = 0) -> str:
     kwargs = {"response_format": {"type": "json_object"}} if json_mode else {}
     resp = await client().chat.completions.create(
-        model=model_name or model(), messages=messages, temperature=0, **kwargs
+        model=model_name or model(), messages=messages, temperature=temperature, **kwargs
     )
     return resp.choices[0].message.content or ""
 
 
-async def chat_json(messages: list, model_name: str | None = None) -> dict:
-    raw = await chat(messages, json_mode=True, model_name=model_name)
+async def chat_json(messages: list, model_name: str | None = None, temperature: float = 0) -> dict:
+    raw = await chat(messages, json_mode=True, model_name=model_name, temperature=temperature)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
