@@ -159,6 +159,12 @@ def _place(location: str) -> str | None:
 def _google_item(ev, recurring: bool) -> Item | None:
     if str(ev.get("STATUS", "")).upper() == "CANCELLED":
         return None
+    import actions
+
+    # Events Violet added to Google Calendar are already on the schedule: never import them twice.
+    # (The iCal feed doesn't carry extendedProperties, so match the event's iCal UID and the marker.)
+    if actions.is_violet_event(str(ev.get("UID", "")), str(ev.get("DESCRIPTION", ""))):
+        return None
     start = ev.get("DTSTART")
     if start is None:
         return None

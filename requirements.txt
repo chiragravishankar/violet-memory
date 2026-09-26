@@ -8,3 +8,6 @@ python-docx
 Pillow
 icalendar
 recurring-ical-events
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2

@@ -33,7 +33,7 @@ LIGHT_MAX = 2  # a day with this many items or fewer gets the light layout
 _ADVICE = re.compile(r"^(prepare|prep|be |focus|stay|remember|make sure|don't|dont|get ready|review|bring|consider|try)"
                      r"|\b(be ready|stay focused|good luck|don't forget)\b", re.I)
 BRIEF_MAX_LINES = 28  # a busy morning gets a little more room before "Show more"
-_FOLLOW_UP = re.compile(r"\b(follow[- ]?up|reach out|email|text|call|ping|reply to|get back to|send .* to)\b", re.I)
+_FOLLOW_UP = schedule.FOLLOW_UP
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "violet.db"
 _db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)

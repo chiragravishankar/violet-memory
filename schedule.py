@@ -636,6 +636,15 @@ def add_event(user_id, it: Item, source: str) -> bool:
     return True
 
 
+FOLLOW_UP = re.compile(r"\b(follow[- ]?up|reach out|email|text|call|ping|reply to|get back to|send .* to)\b", re.I)
+
+
+def mark_done_id(item_id: int) -> None:
+    _db.execute("UPDATE items SET done = 1 WHERE id = ?", (item_id,))
+    _db.execute("DELETE FROM reminders WHERE item_id = ? AND sent = 0", (item_id,))
+    _db.commit()
+
+
 def mark_done(user_id, query: str) -> Item | None:
     """Mark the upcoming deadline or item best matching the query as done (reminders stop)."""
     now = datetime.now(TZ)
