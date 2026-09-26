@@ -104,6 +104,28 @@ previews what would fire at that moment.
 - Messages from one user that arrive within 3 seconds are joined, so a long paste that
   Telegram splits is handled as one message (every text reply waits that long).
 
+## Event discovery
+
+- `eventsources.py`: the pluggable layer (shared `Event` shape, source registry, polite HTTP
+  client) and the per-source lead times in one place (`LEAD_DAYS`: nyu_events 3 to 4 days,
+  luma 6 to 8, default 3 to 4). A new source (Luma, Engage, Meetup) is one module listed in
+  `sources()`.
+- `nyu_events.py`: events.nyu.edu (LiveWhale). JSON feeds for the next 30 days: all events
+  (2 pages of 1000), tag `ihub`, and the groups Engineering (Tandon), Stern, Wasserman-Center,
+  wasserman-center-feed-only, Entrepreneurial-Institute (runs the Leslie eLab) and
+  Berkley-Center-for-Entrepreneurship. Every 6 hours, or `/events refresh`.
+- `events.py`: events table (separate from the schedule, deduped by id), scoring 0 to 100
+  against the profile in batches with the fast model (cached per event), calendar conflicts,
+  suggestion windows, and replies.
+- Suggestions: 9 to 11 AM New York, one message, up to 3 events scoring 70+, never clashing
+  with a class, inside the source's lead window (pulled earlier to land a day before a stated
+  registration deadline). Events found after their window opened are suggested once only if
+  they score 90+ ("Heads up, this is Thursday"). Never the same event twice. Quiet hours respected.
+- `/events` top 5 for the next 7 days, `/events all` by day, `/events refresh`. Reply "going"
+  (adds it to the calendar, reminders 1 day and 2 hours before, saves to memory), "not for me",
+  "more like this" or "remind me later" (back the day before). Questions like "any career events
+  this week?" are answered from the events table.
+
 ## Calendar feeds
 
 Set `BRIGHTSPACE_ICS_URL`, `GOOGLE_ICS_URL` and `CALENDAR_USER_ID` (your Telegram

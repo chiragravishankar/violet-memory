@@ -288,3 +288,86 @@ async def reminder_message(user_id, it: schedule.Item, lead: str, now: datetime,
             "(a group deliverable with teammates beats a routine one). Say deadlines like a person "
             "(\"due at 2\", \"due Friday\"), no labels like \"Next due:\". Two short sentences max.")
     return await voice.say(user_id, "\n".join(facts), kind="reminder", recent=recent)
+
+
+# ---------- Events ----------
+
+_EVENT_WORDS = re.compile(
+    r"\b(events?|happening|what'?s on|whats on|going on|workshops?|mixers?|meetups?|talks?|panels?|fairs?|"
+    r"info sessions?|networking|hackathons?|pitch nights?|speakers?|career events?)\b",
+    re.I,
+)
+
+PICKS_TASK = """It's {when}. Write his morning event picks, one message, best first.
+
+Events (facts to use; keep each link exactly as given):
+{facts}
+
+Shape, like this example:
+A couple worth your time this week.
+Startup Pitch Night at Leslie eLab, Thu 6:30 PM. Good fit for your credits pitch, lots of founders. You're free. https://...
+Wasserman fintech recruiting session, Fri 4 PM. Fits your Summer 2027 internship search. https://...
+Say 'going' to either and I'll add it to your calendar.
+
+One short lead-in line. Then one short paragraph per event: name and host or place, day and time, the
+why in a few words, "You're free" or the clash, a registration deadline if there is one, then the link
+on the same line. A "last-minute" event starts with "Heads up, this is <day>". A "you asked me to
+remind you" event says so briefly. End with one line on replying 'going', 'not for me', 'more like
+this' or 'remind me later' (short, natural)."""
+
+EVENTS_ANSWER_TASK = """He asked: "{question}"
+
+Relevant NYU events from {start} to {end}, best matches first (facts; keep links exactly):
+{facts}
+
+Answer from these only. Pick what fits the question (for example, career events, or what's at a
+place). One short line per event: name, day and time, place, a few words on why, the link. If none
+fit, say so plainly. Never invent events or links."""
+
+
+def is_event_question(text: str) -> bool:
+    return bool(_EVENT_WORDS.search(text))
+
+
+def _ensure_links(text: str, items) -> str:
+    """Every event's link must be in the message; append any the model dropped."""
+    missing = [s.event.url for s in items if s.event.url and s.event.url not in text]
+    return text + ("\n" + "\n".join(missing) if missing else "")
+
+
+async def picks_message(user_id, picks, at: datetime, recent: list[str] | None = None) -> str:
+    import events  # local: events imports voice and schedule
+
+    facts = "\n".join(f"{n}. {events.fact_line(p)}" for n, p in enumerate(picks, 1))
+    task = PICKS_TASK.format(when=f"{at:%A %b} {at.day}, 9 AM", facts=facts)
+    try:
+        text = await voice.compose(user_id, task, recent)
+    except Exception as e:
+        log.warning("picks message failed (%s)", type(e).__name__)
+        text = "A few events worth a look:\n" + "\n\n".join(events.list_line(p) for p in picks)
+    return _ensure_links(text, picks)
+
+
+async def answer_events(user_id, question: str, now: datetime | None = None, recent: list[str] | None = None) -> str:
+    """Questions about events, from the events table (lead times don't apply)."""
+    import events
+
+    now = now or datetime.now(TZ)
+    start_d, end_d, _ = schedule.parse_range(question, now.date()) or (now.date(), now.date() + timedelta(days=6), "")
+    start = max(now, datetime.combine(start_d, datetime.min.time(), tzinfo=TZ))
+    end = datetime.combine(end_d, datetime.max.time(), tzinfo=TZ)
+    found = events.matches(user_id, start, end, min_score=30)[:25]
+    if not found:
+        return await voice.say(user_id, f"No relevant NYU events found from {schedule.fmt_day(start_d)} to "
+                                        f"{schedule.fmt_day(end_d)}.", kind="answer", user_message=question, recent=recent)
+    facts = "\n".join(events.fact_line(s) for s in found)
+    task = EVENTS_ANSWER_TASK.format(question=question, start=schedule.fmt_day(start_d), end=schedule.fmt_day(end_d), facts=facts)
+    try:
+        text = await voice.compose(user_id, task, recent, max_emoji=1)
+    except Exception as e:
+        log.warning("events answer failed (%s)", type(e).__name__)
+        return FALLBACK
+    shown = [s.event.id for s in found if s.event.url and s.event.url in text]
+    if shown:
+        events.remember_list(user_id, shown)
+    return text

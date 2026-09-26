@@ -14,6 +14,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 import assistant
 import brain  # loads .env
 import docs
+import events
 import feeds
 import ingest
 import onboarding
@@ -28,6 +29,7 @@ log = logging.getLogger("bot")
 # Reference list shown word for word under /help (not a reply; the reply is voiced).
 COMMANDS = (
     "/week  your next 7 days\n"
+    "/events  best NYU events this week (/events all, /events refresh)\n"
     "/undo  remove what your last file added\n"
     "/me  what I know about you (/me setup, /me edit, /me reflect)\n"
     "/forget <text>  make me forget something\n"
@@ -217,6 +219,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
         await speak(update, await _reflection_reply(update, context, user_id, text), kind="confirmation", user_message=text)
         return
 
+    action = events.parse_action(text)
+    if action and action[0] and events.last_list(user_id):
+        set_classification(rows, f"event_{action[0]}")
+        await _event_reply(update, context, user_id, text, *action)
+        return
+
     recent = recent_replies(user_id)
     c = await assistant.classify(text, user_id=user_id, recent=recent)
     label = c.type + ("+schedule" if c.about_schedule else "") + ("+about_user" if c.about_user else "")
@@ -233,6 +241,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
     # Learn lasting facts in the background; never slows the reply.
     context.application.create_task(_learn(user_id, text))
 
+    if c.type == assistant.QUESTION and assistant.is_event_question(text):
+        await reply(update, await _with_typing(update, context, assistant.answer_events(user_id, text, recent=recent)))
+        return
     if c.type == assistant.QUESTION:
         answer = await _with_typing(
             update, context, assistant.answer(user_id, text, c.about_schedule, about_user=c.about_user, recent=recent)
@@ -260,6 +271,64 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
         await reply(update, c.ack)  # written in the same call as the classification
     else:
         await speak(update, "Kept it. Acknowledge the specific thing.", kind="save", user_message=text)
+
+
+async def _event_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id, text: str,
+                       action: str, ref: str) -> None:
+    chosen, cands = events.resolve(user_id, ref)
+    if not chosen:
+        names = "; ".join(f"{n}. {e.title} ({events.when(e)})" for n, e in enumerate(cands, 1))
+        await speak(update, f"Not sure which event he means. Ask which one, by name or number: {names}",
+                    kind="question", user_message=text)
+        return
+    drafts = [await events.act(user_id, action, e) for e in chosen]
+    if action == "going":
+        context.application.create_task(brain.connect(user_id))
+    await speak(update, " ".join(drafts), kind="confirmation", user_message=text)
+
+
+async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/events: top 5 in the next 7 days. /events all: everything relevant this week by day.
+    /events refresh: fetch now."""
+    log_message("in", update, inbound_text(update))
+    user_id = update.effective_user.id
+    sub = context.args[0].lower() if context.args else ""
+    said = inbound_text(update)
+    now = datetime.now(schedule.TZ)
+    if sub == "refresh":
+        report = await _with_typing(update, context, events.refresh(now))
+        scored = await _with_typing(update, context, events.score_new(user_id, now))
+        got = "; ".join(f"{k}: {v.get('fetched', 0)} upcoming, {v.get('new', 0)} new" if "error" not in v
+                        else f"{k}: failed ({v['error']})" for k, v in report.items())
+        await speak(update, f"Refreshed the event feeds. {got}. Scored {scored} new ones for him.",
+                    kind="confirmation", user_message=said)
+        return
+    top = events.matches(user_id, now, now + timedelta(days=7))
+    if sub == "all":
+        if not top:
+            await speak(update, "No relevant NYU events in the next 7 days.", kind="answer", user_message=said)
+            return
+        by_day: dict = {}
+        for s in sorted(top, key=lambda s: s.event.start):
+            by_day.setdefault(schedule.fmt_day(s.event.start.date()), []).append(s)
+        lines = []
+        for day, items in by_day.items():
+            lines.append(day)
+            for s in items:
+                t = "all day" if s.event.all_day else schedule.fmt_time(s.event.start.time())
+                lines.append(f"  {t} {s.event.title}, {events.where(s.event)}\n  {s.event.url}")
+        events.remember_list(user_id, [s.event.id for s in top])
+        await speak(update, f"All {len(top)} relevant NYU events in the next 7 days are below, by day. Short lead-in.",
+                    kind="answer", user_message=said, attach="\n".join(lines))
+        return
+    top = top[:5]
+    if not top:
+        await speak(update, "No strong NYU event matches in the next 7 days.", kind="answer", user_message=said)
+        return
+    events.remember_list(user_id, [s.event.id for s in top])
+    await speak(update, "His top NYU event matches for the next 7 days are below, best first. Short lead-in; "
+                        "mention he can reply 'going', 'not for me', 'more like this' or 'remind me later'.",
+                kind="answer", user_message=said, attach="\n\n".join(events.list_line(s) for s in top))
 
 
 async def _remember(user_id, text: str) -> None:
@@ -412,8 +481,19 @@ async def demo_time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def demo_time(user_id, at: datetime) -> str:
     head = f"🕒 Pretending it's {schedule.fmt_day(at.date())}, {schedule.fmt_time(at.time())}"
     due = schedule.preview_reminders(user_id, at)
+    parts = [head]
+    if at.time() == events.DELIVERY_TIME:
+        picks = events.picks_for_day(user_id, at.date(), demo=True)
+        if picks:
+            msg = await assistant.picks_message(user_id, picks, at, recent_replies(user_id))
+            events.record_picks(user_id, at.date(), picks, msg, demo=True)
+            parts.append(msg)
     if not due:
-        return head + "\n\n" + await voice.say(user_id, "No reminders go out at that moment.", kind="info")
+        if len(parts) == 1:
+            parts.append(await voice.say(user_id, "Nothing would go out at that moment: no reminders and no event "
+                                                  "picks that day.", kind="info"))
+        return "\n\n".join(parts)
+    head = "\n\n".join(parts)
     texts = [await assistant.reminder_message(user_id, it, lead, at) for it, lead in due]
     return head + "\n\n" + "\n\n".join(texts)
 
@@ -534,11 +614,45 @@ async def profile_loop(app: Application) -> None:
                     log.warning("weekly reflection failed (%s)", type(e).__name__)
 
 
+def event_users() -> list[str]:
+    ids = {feeds.calendar_user()} | {u for u in selfmodel.all_user_ids() if u.isdigit()}
+    return sorted(u for u in ids if u)
+
+
+async def events_loop(app: Application) -> None:
+    """Fetch event sources every 6 hours (and score what's new). At 9:00 AM New York, send each
+    user one message with up to 3 picks, unless it's their quiet hours (then it waits)."""
+    last_fetch = None
+    while True:
+        now = datetime.now(schedule.TZ)
+        try:
+            if last_fetch is None or now - last_fetch >= events.eventsources.FETCH_EVERY:
+                last_fetch = now
+                await events.refresh(now)
+                for user_id in event_users():
+                    await events.score_new(user_id, now)
+            if events.DELIVERY_TIME <= now.time() < events.DELIVERY_UNTIL:
+                for user_id in event_users():
+                    if events.picked_today(user_id, now.date()) or selfmodel.quiet_until(user_id, now):
+                        continue
+                    picks = events.picks_for_day(user_id, now.date())
+                    msg = await assistant.picks_message(user_id, picks, now, recent_replies(user_id)) if picks else None
+                    events.record_picks(user_id, now.date(), picks, msg)
+                    if msg:
+                        events.remember_list(user_id, [p.event.id for p in picks])
+                        await app.bot.send_message(chat_id=int(user_id), text=msg)
+                        log_raw("out", int(user_id), int(user_id), msg)
+        except Exception:
+            log.exception("events loop error")
+        await asyncio.sleep(60)
+
+
 async def post_init(app: Application) -> None:
     schedule.plan_all_reminders()
     app.create_task(send_reminders(app))
     app.create_task(sync_feeds(app))
     app.create_task(profile_loop(app))
+    app.create_task(events_loop(app))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -563,6 +677,7 @@ def main() -> None:
     app.add_handler(CommandHandler("demo_time", demo_time_cmd))
     app.add_handler(CommandHandler("me", me_cmd))
     app.add_handler(CommandHandler("forget", forget_cmd))
+    app.add_handler(CommandHandler("events", events_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, on_other))

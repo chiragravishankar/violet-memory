@@ -33,7 +33,7 @@ SOURCES = {"onboarding", "chat", "document", "calendar", "inferred"}
 CORE_NODE_SET = ["core_profile"]
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "violet.db"
-_db = sqlite3.connect(DB_PATH, check_same_thread=False)
+_db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
 _db.row_factory = sqlite3.Row
 _db.execute(
     """CREATE TABLE IF NOT EXISTS profiles (

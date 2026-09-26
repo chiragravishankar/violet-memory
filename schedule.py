@@ -33,7 +33,7 @@ MAX_PARALLEL = 4
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "violet.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-_db = sqlite3.connect(DB_PATH, check_same_thread=False)
+_db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
 _db.row_factory = sqlite3.Row
 _db.executescript(
     """
@@ -608,6 +608,20 @@ def sync_events(user_id, events: list[Item], source: str) -> SyncResult:
     return result
 
 
+def add_event(user_id, it: Item, source: str) -> bool:
+    """Put an event he's going to on his calendar (with reminders). False if already there."""
+    uid = str(user_id)
+    if _db.execute("SELECT 1 FROM items WHERE user_id = ? AND uid = ?", (uid, it.uid)).fetchone():
+        return False
+    batch = _db.execute(
+        "INSERT INTO batches (user_id, kind, label, created_at) VALUES (?, ?, ?, ?)",
+        (uid, source, it.title[:60], datetime.now(timezone.utc).isoformat()),
+    ).lastrowid
+    _insert_item(uid, batch, source, it, datetime.now(TZ))
+    _db.commit()
+    return True
+
+
 def undo_last_file(user_id) -> tuple[str, int] | None:
     """Remove every item added from the user's most recent file. Returns (label, count)."""
     uid = str(user_id)
@@ -637,10 +651,13 @@ DEADLINE_LEADS = [("3d", timedelta(days=3)), ("1d", timedelta(days=1)), ("3h", t
 EXAM_LEADS = [("1w", timedelta(weeks=1))] + DEADLINE_LEADS
 CLASS_LEAD = ("30m", timedelta(minutes=30))
 EVENT_LEAD = ("1h", timedelta(hours=1))
+# Events he said "going" to from discovery (source "nyu_events", later "luma", ...): 1 day and 2 hours.
+RSVP_LEADS = [("1d", timedelta(days=1)), ("2h", timedelta(hours=2))]
+CALENDAR_SOURCES = {"file", "chat", "brightspace", "google"}
 STALE_AFTER = timedelta(hours=1)  # a reminder missed by more than this (bot was off) is dropped
 LEAD_WORDS = {
     "1w": "in 1 week", "3d": "in 3 days", "1d": "tomorrow", "3h": "in 3 hours",
-    "1h": "in 1 hour", "30m": "in 30 minutes",
+    "1h": "in 1 hour", "30m": "in 30 minutes", "2h": "in 2 hours",
 }
 
 
@@ -662,7 +679,12 @@ def reminder_plan(it: Item, start: datetime, end: datetime) -> list[tuple[str, d
     if it.kind in ("class_session", "event"):
         if it.due_time is None:
             return []
-        leads = [CLASS_LEAD] if it.kind == "class_session" else [EVENT_LEAD]
+        if it.kind == "class_session":
+            leads = [CLASS_LEAD]
+        elif it.source and it.source not in CALENDAR_SOURCES:
+            leads = RSVP_LEADS  # an event he chose to go to
+        else:
+            leads = [EVENT_LEAD]
     else:
         leads = EXAM_LEADS if it.kind == "exam" else DEADLINE_LEADS
     due = due_datetime(it)
