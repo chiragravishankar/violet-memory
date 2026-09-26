@@ -104,6 +104,22 @@ previews what would fire at that moment.
 - Messages from one user that arrive within 3 seconds are joined, so a long paste that
   Telegram splits is handled as one message (every text reply waits that long).
 
+## Formatting and the daily brief
+
+- `fmt.py`: the one formatter (Telegram HTML). Section headers "📅 <b>TODAY</b>", bold times
+  first, "↳" details, bold "TUE 29" day headers, "•" for deadlines and exams, icons with fixed
+  meanings (🎓 class, 📌 deadline, 📝 exam, 🤝 meeting, 🎟 event, 👤 person, 💡 tip), "Register"
+  links, titles trimmed to ~45 chars, no em dashes, all text escaped, ~25 lines per message with a
+  "Show more" button. If Telegram rejects the HTML, the message is resent as plain text.
+- `views.py`: every structured view (/today, /week, schedule answers, events, reminders) is
+  rendered by code; the model only writes short lines (a lead-in, an event's why, a context line).
+  Buttons: /week [◀ This week] [Next week ▶]; events [✅ Going] [⏰ Later] [✖ Not for me].
+- `brief.py`: the morning brief at 8:00 AM New York (/brief time 7:30, /brief off, /brief on),
+  Sundays the 7 PM weekly preview instead. Data comes from code (agenda, due soon, exams,
+  LockDown items, follow-ups, one event pick scoring 80+ with no clash); memory lookups per class
+  or meeting run in parallel with a 6 s timeout. Never sent twice a day (SQLite `briefs`).
+  /brief (now), /brief tomorrow, /brief week. Buttons [📅 Full week] [🎟 Events].
+
 ## Event discovery
 
 - `eventsources.py`: the pluggable layer (shared `Event` shape, source registry, polite HTTP

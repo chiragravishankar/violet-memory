@@ -8,12 +8,16 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import secrets
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 import assistant
 import brain  # loads .env
+import brief
 import docs
 import events
 import feeds
@@ -21,7 +25,9 @@ import ingest
 import onboarding
 import schedule
 import selfmodel
+import views
 import voice
+from fmt import View
 
 logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -29,7 +35,9 @@ log = logging.getLogger("bot")
 
 # Reference list shown word for word under /help (not a reply; the reply is voiced).
 COMMANDS = (
+    "/today  today at a glance\n"
     "/week  your next 7 days\n"
+    "/brief  your morning brief (/brief tomorrow, /brief week, /brief off, /brief on, /brief time 7:30)\n"
     "/events  best events this week, NYU and Luma (/events all, /events refresh, /events add_luma <url>)\n"
     "/undo  remove what your last file added\n"
     "/me  what I know about you (/me setup, /me edit, /me reflect)\n"
@@ -98,6 +106,44 @@ async def reply(update: Update, text: str) -> None:
     log_message("out", update, text)
 
 
+_more_pages: dict[str, list[str]] = {}
+
+
+def _markup(v: View) -> InlineKeyboardMarkup | None:
+    rows = [[InlineKeyboardButton(label, callback_data=action[:64]) for label, action in row] for row in v.buttons]
+    if v.more:
+        token = secrets.token_hex(4)
+        _more_pages[token] = v.more
+        rows.append([InlineKeyboardButton("Show more", callback_data=f"more:{token}")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def send_view(bot, chat_id: int, v: View, edit_message=None) -> None:
+    """Send (or edit) a structured view as HTML; if Telegram rejects the formatting, resend plain."""
+    markup = _markup(v)
+    try:
+        if edit_message is not None:
+            await edit_message.edit_text(v.html, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                         disable_web_page_preview=True)
+        else:
+            await bot.send_message(chat_id, v.html, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                   disable_web_page_preview=True)
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            return
+        log.warning("HTML send failed (%s), sending plain text", e)
+        await bot.send_message(chat_id, v.plain, reply_markup=markup, disable_web_page_preview=True)
+    log_raw("out", chat_id, chat_id, v.plain)
+
+
+async def reply_any(update: Update, context: ContextTypes.DEFAULT_TYPE, answer) -> None:
+    """Send a reply that may be plain text or a structured view."""
+    if isinstance(answer, View):
+        await send_view(context.bot, update.effective_chat.id, answer)
+    else:
+        await reply(update, answer)
+
+
 async def speak(update: Update, draft: str, kind: str = "info", user_message: str | None = None,
                 attach: str | None = None) -> None:
     """Every reply goes through the voice layer: the draft says what to get across."""
@@ -149,14 +195,51 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
+    await send_view(context.bot, update.effective_chat.id, views.week_view(update.effective_user.id))
+
+
+async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log_message("in", update, inbound_text(update))
+    await send_view(context.bot, update.effective_chat.id, views.today_view(update.effective_user.id))
+
+
+async def brief_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/brief (now), /brief tomorrow, /brief week, /brief off, /brief on, /brief time 7:30"""
+    log_message("in", update, inbound_text(update))
     user_id = update.effective_user.id
+    said = inbound_text(update)
+    sub = context.args[0].lower() if context.args else "now"
     now = datetime.now(schedule.TZ)
-    lines = schedule.agenda_lines(user_id, now.date(), now.date() + timedelta(days=6), now)
-    if not lines:
-        await speak(update, "Nothing on his calendar for the next 7 days.", kind="answer", user_message="/week")
-        return
-    await speak(update, "His next 7 days are below. Lead in with a few words, pointing out what stands out "
-                        "(an exam, a busy day) if anything.", kind="answer", user_message="/week", attach="\n".join(lines))
+    if sub in ("off", "on"):
+        brief.set_settings(user_id, enabled=sub == "on")
+        await speak(update, f"Morning brief turned {sub}.", kind="confirmation", user_message=said)
+    elif sub == "time":
+        t = brief.parse_time(" ".join(context.args[1:]))
+        if not t:
+            await speak(update, "Show the format: /brief time 7:30", kind="error", user_message=said)
+            return
+        brief.set_settings(user_id, time=t.strftime("%H:%M"))
+        await speak(update, f"Morning brief moved to {schedule.fmt_time(t)} New York time (Sundays stay the "
+                            "7 PM weekly preview).", kind="confirmation", user_message=said)
+    elif sub == "week":
+        await send_view(context.bot, update.effective_chat.id, await _with_typing(update, context, brief.weekly(user_id, now)))
+    elif sub == "tomorrow":
+        v = await _with_typing(update, context, brief.daily(user_id, now.date() + timedelta(days=1), now))
+        await send_view(context.bot, update.effective_chat.id, v)
+    else:
+        v = await _with_typing(update, context, brief.daily(user_id, now.date(), now))
+        await _deliver_brief(context.bot, user_id, now.date(), v)
+
+
+async def _deliver_brief(bot, user_id, day, v: View) -> None:
+    """Send a daily brief, record it (never twice a day), and mark its event pick suggested."""
+    await send_view(bot, int(user_id), v)
+    brief.mark_sent(user_id, day, "daily", v.plain)
+    pick = getattr(v, "pick", None)
+    if pick is not None:
+        # Suggested once only: the 9 AM picks won't repeat it.
+        events.mark_suggested(user_id, pick.event.id)
+        events.remember_list(user_id, [pick.event.id])
 
 
 async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -251,13 +334,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
     context.application.create_task(_learn(user_id, text))
 
     if c.type == assistant.QUESTION and assistant.is_event_question(text):
-        await reply(update, await _with_typing(update, context, assistant.answer_events(user_id, text, recent=recent)))
+        await reply_any(update, context, await _with_typing(update, context, assistant.answer_events(user_id, text, recent=recent)))
         return
     if c.type == assistant.QUESTION:
         answer = await _with_typing(
             update, context, assistant.answer(user_id, text, c.about_schedule, about_user=c.about_user, recent=recent)
         )
-        await reply(update, answer)
+        await reply_any(update, context, answer)
         return
 
     # Reply first; the save runs in the background. cognee.add waits for any graph build
@@ -337,32 +420,19 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await speak(update, f"Refreshed the event feeds. {got}. Scored {scored} new ones for him.",
                     kind="confirmation", user_message=said)
         return
+    await send_view(context.bot, update.effective_chat.id, _events_view(user_id, sub == "all", now))
+
+
+def _events_view(user_id, all_of_them: bool, now: datetime) -> View:
     top = events.matches(user_id, now, now + timedelta(days=7))
-    if sub == "all":
-        if not top:
-            await speak(update, "No relevant events in the next 7 days.", kind="answer", user_message=said)
-            return
-        by_day: dict = {}
-        for s in sorted(top, key=lambda s: s.event.start):
-            by_day.setdefault(schedule.fmt_day(s.event.start.date()), []).append(s)
-        lines = []
-        for day, items in by_day.items():
-            lines.append(day)
-            for s in items:
-                t = "all day" if s.event.all_day else schedule.fmt_time(s.event.start.time())
-                lines.append(f"  {t} {s.event.title}, {events.where(s.event)}\n  {s.event.url}")
-        events.remember_list(user_id, [s.event.id for s in top])
-        await speak(update, f"All {len(top)} relevant events (NYU Events and Luma) in the next 7 days are below, by day. Short lead-in.",
-                    kind="answer", user_message=said, attach="\n".join(lines))
-        return
-    top = top[:5]
     if not top:
-        await speak(update, "No strong event matches in the next 7 days.", kind="answer", user_message=said)
-        return
+        return View("🎟 <b>EVENTS</b>\n\nNo strong matches in the next 7 days.")
+    if all_of_them:
+        events.remember_list(user_id, [s.event.id for s in top])
+        return views.events_by_day_view(top, now)
+    top = top[:5]
     events.remember_list(user_id, [s.event.id for s in top])
-    await speak(update, "His top event matches (NYU Events and Luma) for the next 7 days are below, best first. Short lead-in; "
-                        "mention he can reply 'going', 'not for me', 'more like this' or 'remind me later'.",
-                kind="answer", user_message=said, attach="\n\n".join(events.list_line(s) for s in top))
+    return views.events_view(top, now, title="Top events", lead="Best matches for the next 7 days.")
 
 
 def _add_env_list(key: str, value: str) -> None:
@@ -374,6 +444,40 @@ def _add_env_list(key: str, value: str) -> None:
     lines = [l for l in lines if not l.startswith(f"{key}=")] + [f"{key}={merged}"]
     env.write_text("\n".join(lines) + "\n")
     os.environ[key] = merged
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tap buttons: week toggle, events, going / later / not for me, show more."""
+    q = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+    data = q.data or ""
+    log_raw("in", user_id, update.effective_chat.id, f"[button] {data}", "button")
+    now = datetime.now(schedule.TZ)
+    if data.startswith("week:"):
+        parts = data.split(":")
+        v = views.week_view(user_id, int(parts[1]), now)
+        # Toggling inside /week edits the message; "Full week" from the brief sends a new one.
+        await send_view(context.bot, update.effective_chat.id, v,
+                        edit_message=None if len(parts) > 2 else q.message)
+    elif data == "events":
+        await send_view(context.bot, update.effective_chat.id, _events_view(user_id, False, now))
+    elif data.startswith("ev:"):
+        _, action, event_id = data.split(":", 2)
+        e = events.get_event(event_id)
+        if e is None:
+            await speak(update, "That event isn't in the list anymore.", kind="error")
+            return
+        draft = await events.act(user_id, {"going": "going", "later": "later", "hide": "hide"}[action], e)
+        if action == "going":
+            context.application.create_task(brain.connect(user_id))
+        await speak(update, draft, kind="confirmation", user_message=f"(tapped {action} on {e.title})")
+    elif data.startswith("more:"):
+        pages = _more_pages.pop(data[5:], None)
+        if not pages:
+            await speak(update, "That list expired. Ask again and you'll get a fresh one.", kind="error")
+            return
+        await send_view(context.bot, update.effective_chat.id, View(pages[0], [], pages[1:]))
 
 
 async def _remember(user_id, text: str) -> None:
@@ -520,27 +624,27 @@ async def demo_time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except ValueError:
         await speak(update, "Show the format: /demo_time 2026-09-29 13:30", kind="info", user_message=inbound_text(update))
         return
-    await reply(update, await _with_typing(update, context, demo_time(update.effective_user.id, at)))
+    for part in await _with_typing(update, context, demo_time(update.effective_user.id, at)):
+        if isinstance(part, View):
+            await send_view(context.bot, update.effective_chat.id, part)
+        else:
+            await reply(update, part)
 
 
-async def demo_time(user_id, at: datetime) -> str:
-    head = f"🕒 Pretending it's {schedule.fmt_day(at.date())}, {schedule.fmt_time(at.time())}"
-    due = schedule.preview_reminders(user_id, at)
-    parts = [head]
+async def demo_time(user_id, at: datetime) -> list:
+    """What would go out at that moment: reminders and (at 9 AM) event picks. Returns views/texts."""
+    out: list = [f"🕒 Pretending it's {schedule.fmt_day(at.date())}, {schedule.fmt_time(at.time())}"]
     if at.time() == events.DELIVERY_TIME:
         picks = events.picks_for_day(user_id, at.date(), demo=True)
         if picks:
-            msg = await assistant.picks_message(user_id, picks, at, recent_replies(user_id))
-            events.record_picks(user_id, at.date(), picks, msg, demo=True)
-            parts.append(msg)
-    if not due:
-        if len(parts) == 1:
-            parts.append(await voice.say(user_id, "Nothing would go out at that moment: no reminders and no event "
-                                                  "picks that day.", kind="info"))
-        return "\n\n".join(parts)
-    head = "\n\n".join(parts)
-    texts = [await assistant.reminder_message(user_id, it, lead, at) for it, lead in due]
-    return head + "\n\n" + "\n\n".join(texts)
+            v = await assistant.picks_message(user_id, picks, at, recent_replies(user_id))
+            events.record_picks(user_id, at.date(), picks, v.plain, demo=True)
+            out.append(v)
+    for it, lead in schedule.preview_reminders(user_id, at):
+        out.append(await assistant.reminder_message(user_id, it, lead, at, recent_replies(user_id)))
+    if len(out) == 1:
+        out.append("Nothing would go out at that moment.")
+    return out
 
 
 async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -621,9 +725,8 @@ async def send_reminders(app: Application) -> None:
             schedule.ensure_class_reminders()
             now = datetime.now(schedule.TZ)
             for user_id, item, lead in schedule.pop_due_reminders(now, quiet_until=selfmodel.quiet_until):
-                text = await assistant.reminder_message(user_id, item, lead, now, recent_replies(user_id))
-                await app.bot.send_message(chat_id=int(user_id), text=text)
-                log_raw("out", int(user_id), int(user_id), text)
+                v = await assistant.reminder_message(user_id, item, lead, now, recent_replies(user_id))
+                await send_view(app.bot, int(user_id), v)
         except Exception:
             log.exception("reminder loop error")
         await asyncio.sleep(30)
@@ -681,14 +784,32 @@ async def events_loop(app: Application) -> None:
                     if events.picked_today(user_id, now.date()) or selfmodel.quiet_until(user_id, now):
                         continue
                     picks = events.picks_for_day(user_id, now.date())
-                    msg = await assistant.picks_message(user_id, picks, now, recent_replies(user_id)) if picks else None
-                    events.record_picks(user_id, now.date(), picks, msg)
-                    if msg:
+                    v = await assistant.picks_message(user_id, picks, now, recent_replies(user_id)) if picks else None
+                    events.record_picks(user_id, now.date(), picks, v.plain if v else None)
+                    if v:
                         events.remember_list(user_id, [p.event.id for p in picks])
-                        await app.bot.send_message(chat_id=int(user_id), text=msg)
-                        log_raw("out", int(user_id), int(user_id), msg)
+                        await send_view(app.bot, int(user_id), v)
         except Exception:
             log.exception("events loop error")
+        await asyncio.sleep(60)
+
+
+async def brief_loop(app: Application) -> None:
+    """Morning brief at each user's time (default 8 AM New York); Sundays the 7 PM weekly preview
+    instead. Never twice for the same day; skipped in quiet hours or if the bot was off too long."""
+    while True:
+        now = datetime.now(schedule.TZ)
+        for user_id in event_users():
+            try:
+                kind = brief.due(user_id, now)
+                if kind == "daily":
+                    await _deliver_brief(app.bot, user_id, now.date(), await brief.daily(user_id, now.date(), now))
+                elif kind == "weekly":
+                    v = await brief.weekly(user_id, now)
+                    await send_view(app.bot, int(user_id), v)
+                    brief.mark_sent(user_id, now.date(), "weekly", v.plain)
+            except Exception:
+                log.exception("brief loop error")
         await asyncio.sleep(60)
 
 
@@ -698,6 +819,7 @@ async def post_init(app: Application) -> None:
     app.create_task(sync_feeds(app))
     app.create_task(profile_loop(app))
     app.create_task(events_loop(app))
+    app.create_task(brief_loop(app))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -723,6 +845,9 @@ def main() -> None:
     app.add_handler(CommandHandler("me", me_cmd))
     app.add_handler(CommandHandler("forget", forget_cmd))
     app.add_handler(CommandHandler("events", events_cmd))
+    app.add_handler(CommandHandler("today", today_cmd))
+    app.add_handler(CommandHandler("brief", brief_cmd))
+    app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, on_other))

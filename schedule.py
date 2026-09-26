@@ -836,36 +836,86 @@ def fmt_class_group(items: list[Item]) -> list[str]:
     return lines
 
 
-def agenda_lines(user_id, start: date, end: date, now: datetime | None = None,
-                 kinds: set[str] | None = None) -> list[str]:
-    """Everything from start to end (both days included, the last up to 11:59 PM), grouped
-    by day, in time order: weekly classes, class sessions, events and meetings, and
-    deadlines (📌) from every source. /week and schedule questions both use this."""
+@dataclass
+class Entry:
+    """One line of the agenda, ready for any view."""
+    day: date
+    sort: time
+    kind: str  # class, deadline, exam, meeting, event
+    time_text: str  # "2:00 PM", "All day", "any time"
+    title: str
+    course: str = ""
+    place: str | None = None
+    who: str | None = None  # e.g. "Prof. Jacoby"
+    note: str | None = None  # e.g. "Needs LockDown Browser"
+    item: "Item | None" = None
+
+
+_PROF_SUFFIX = re.compile(r"^(.*?)\s+-\s+([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+)?)$")
+
+
+def split_class_title(title: str) -> tuple[str, str | None]:
+    """"Operation Management - Jacoby" -> ("Operation Management", "Prof. Jacoby")."""
+    m = _PROF_SUFFIX.match(title.strip())
+    return (m.group(1), f"Prof. {m.group(2)}") if m else (title, None)
+
+
+def agenda_entries(user_id, start: date, end: date, now: datetime | None = None,
+                   kinds: set[str] | None = None) -> list[Entry]:
+    """Everything from start to end (both days included, the last up to 11:59 PM), in day and
+    time order: weekly classes, class sessions, meetings, events he's going to, deadlines and exams,
+    from every source. /today, /week, schedule questions and the brief all use this."""
     now = now or datetime.now(TZ)
     items = [i for i in existing_items(user_id) if kinds is None or i.kind in kinds]
-    lines = []
+    out: list[Entry] = []
     d = start
     while d <= end:
-        entries = []  # (sort key, line)
+        day = []
         for i in items:
             if i.kind == "class" and i.weekday == d.weekday() and d <= SEMESTER_END:
-                room = f", {i.room}" if i.room else ""
-                entries.append((i.start_time, f"  {fmt_time(i.start_time)} 🎓 {i.course or i.title} class{room}"))
+                day.append(Entry(d, i.start_time, "class", fmt_time(i.start_time), i.course or i.title,
+                                 course=i.course, place=i.room, item=i))
             elif i.kind in ("event", "class_session") and i.due_date == d:
                 if i.due_time and d == now.date() and due_datetime(i) < now:
                     continue  # already over today
                 when = fmt_time(i.due_time) if i.due_time else "All day"
-                room = f", {i.room}" if i.room else ""
-                icon = "🎓 " if i.kind == "class_session" else ""
-                entries.append((i.due_time or time(0, 0), f"  {when} {icon}{i.title}{room}"))
+                if i.kind == "class_session":
+                    title, who = split_class_title(i.title)
+                    day.append(Entry(d, i.due_time or time(0, 0), "class", when, title, course=i.course,
+                                     place=i.room, who=who, item=i))
+                else:
+                    kind = "event" if i.source and i.source not in CALENDAR_SOURCES else "meeting"
+                    day.append(Entry(d, i.due_time or time(0, 0), kind, when, i.title, place=i.room, item=i))
             elif i.kind in DEADLINE_KINDS and i.due_date == d:
                 when = fmt_time(i.due_time) if i.due_time else "any time"
-                lock = " 🔒" if i.note and "LockDown" in i.note else ""
-                entries.append((i.due_time or END_OF_DAY, f"  📌 {label(i)}, due {when}{lock}"))
-        if entries:
-            lines.append(("Today, " if d == now.date() else "") + fmt_day(d))
-            lines += [line for _, line in sorted(entries, key=lambda e: e[0])]
+                note = "Needs LockDown Browser" if i.note and "LockDown" in i.note else None
+                day.append(Entry(d, i.due_time or END_OF_DAY, "exam" if i.kind == "exam" else "deadline", when,
+                                 i.title, course=i.course, note=note, item=i))
+        out += sorted(day, key=lambda e: e.sort)
         d += timedelta(days=1)
+    return out
+
+
+_TEXT_ICON = {"class": "🎓 ", "deadline": "📌 ", "exam": "📌 ", "meeting": "", "event": ""}
+
+
+def agenda_lines(user_id, start: date, end: date, now: datetime | None = None,
+                 kinds: set[str] | None = None) -> list[str]:
+    """Plain-text agenda (for the model to read), built from agenda_entries."""
+    now = now or datetime.now(TZ)
+    lines, last_day = [], None
+    for e in agenda_entries(user_id, start, end, now, kinds):
+        if e.day != last_day:
+            lines.append(("Today, " if e.day == now.date() else "") + fmt_day(e.day))
+            last_day = e.day
+        if e.kind in ("deadline", "exam"):
+            lock = " 🔒" if e.note else ""
+            name = f"{e.title} ({e.course})" if e.course and e.course.lower() not in e.title.lower() else e.title
+            lines.append(f"  📌 {name}, due {e.time_text}{lock}")
+        else:
+            where = f", {e.place}" if e.place else ""
+            what = f"{e.title} class" if e.kind == "class" and e.item and e.item.kind == "class" else e.title
+            lines.append(f"  {e.time_text} {_TEXT_ICON[e.kind]}{what}{where}")
     return lines
 
 

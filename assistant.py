@@ -1,6 +1,7 @@
 """Understanding messages: classify, answer questions from schedule + memory, corrections and
 reminders. Every reply is written by the voice layer (voice.py). No channel code here."""
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -10,7 +11,9 @@ import brain
 import llm
 import schedule
 import selfmodel
+import views
 import voice
+from fmt import View
 from schedule import TZ
 
 log = logging.getLogger("assistant")
@@ -40,17 +43,6 @@ sentences, sometimes with one helpful beat. Empty string otherwise.
 Return JSON: {{"type": "question|schedule|memory|correction", "about_schedule": true|false, "about_user": true|false, "ack": "..."}}
 
 His message: \"\"\"{text}\"\"\""""
-
-AGENDA_TASK = """He asked: "{question}"
-
-Answer from his agenda for {period} ({start} to {end}), filtered to {kinds}. It is complete and
-comes from all his calendars. Only the agenda counts for dates and times.
-{shape}
-
-Agenda:
-{agenda}
-{after}
-Other things you know that may help (only add a detail if it's clearly relevant): {context}"""
 
 ADVICE_TASK = """He asked: "{question}"
 
@@ -109,7 +101,6 @@ _NOT_NAME_WORDS = {
     "ready", "late", "early", "tired", "busy", "free", "done", "sick", "gym", "student", "class", "work",
     "school", "bored", "hungry", "confused", "lost", "stuck", "new", "just", "still", "also", "your", "you",
 }
-LIST_INLINE_MAX = 4  # agendas with more items than this are attached word for word
 
 
 @dataclass
@@ -150,19 +141,6 @@ async def classify(text: str, user_id=None, recent: list[str] | None = None) -> 
                           voice.vary_opener(voice.trim_offer(voice.polish(ack, budget), recent), recent) if ack else "")
 
 
-def _kinds_label(kinds: set[str] | None) -> str:
-    if not kinds:
-        return "classes, meetings, events and deadlines"
-    names = []
-    if kinds & schedule.DEADLINE_KINDS:
-        names.append("deadlines")
-    if "event" in kinds:
-        names.append("meetings and events")
-    if kinds & schedule.CLASS_KINDS:
-        names.append("classes")
-    return " and ".join(names)
-
-
 def is_schedule_question(question: str, about_schedule: bool, today) -> bool:
     return about_schedule or bool(_SCHEDULE_WORDS.search(question)) or schedule.parse_range(question, today) is not None
 
@@ -172,7 +150,7 @@ async def _context(user_id, question: str, limit: int = 2500) -> str:
 
 
 async def answer(user_id, question: str, about_schedule: bool, now: datetime | None = None,
-                 about_user: bool = False, recent: list[str] | None = None) -> str:
+                 about_user: bool = False, recent: list[str] | None = None) -> "str | View":
     """Answer a question in Violet's voice: schedule questions from the same agenda as /week
     (plus graph context), questions about him from his profile first, others from the graph."""
     now = now or datetime.now(TZ)
@@ -210,31 +188,9 @@ async def _answer(user_id, question, about_schedule, now, about_user, recent) ->
         return await voice.compose(user_id, task, recent, max_emoji=3)
 
     kinds = schedule.parse_kinds(question)
-    lines = schedule.agenda_lines(user_id, start, end, now, kinds)
-    # Only offered when the period is empty, so the answer can't wander past it.
-    after = [] if lines else schedule.agenda_lines(user_id, end + timedelta(days=1), end + timedelta(days=7), now, kinds)
-    shown = lines or after
-    n_items = sum(1 for line in shown if line.startswith("  "))
-    log.info("schedule question: %s, %s to %s, kinds %s, %d agenda lines",
-             period, start, end, sorted(kinds) if kinds else "all", len(lines))
-    attach = "\n".join(shown) if n_items > LIST_INLINE_MAX else None
-    if attach:
-        shape = ("The full agenda will be shown word for word right below your reply. Write only a short, "
-                 "natural lead-in (one sentence, can note what stands out, like an exam). Don't list the items.")
-    else:
-        shape = "Answer in a natural sentence or two, or a line per item. Include every item, with day and time."
-    if not lines:
-        shape += (" Nothing matches in that period: say so plainly with the dates, then give what's next up"
-                  " (below).")
-    task = AGENDA_TASK.format(
-        question=question, period=period, start=schedule.fmt_day(start), end=schedule.fmt_day(end),
-        kinds=_kinds_label(kinds), shape=shape,
-        agenda="\n".join(lines) or "(nothing)",
-        after=f"\nNext up after that:\n" + "\n".join(after) + "\n" if after else "",
-        context=await _context(user_id, question, 800),
-    )
-    lead = await voice.compose(user_id, task, recent)
-    return f"{lead}\n\n{attach}" if attach else lead
+    log.info("schedule question: %s, %s to %s, kinds %s", period, start, end, sorted(kinds) if kinds else "all")
+    # Rendered by code from the shared agenda: same layout as /week, every time.
+    return views.period_view(user_id, start, end, period, kinds, now)
 
 
 # ---------- Corrections ----------
@@ -269,25 +225,37 @@ async def correct(user_id, text: str, last_reply: str | None = None, recent: lis
 # ---------- Reminders ----------
 
 
+CONTEXT_TASK = """Write ONE short line (max 12 words) for a reminder about {what}. Only facts below.
+Most useful first: a teammate or group deliverable for this course, then the next deadline.
+Say deadlines like a person ("your Chewy section is due Friday"). If nothing useful, return: none
+
+Coming up for this course: {upcoming}
+What you know about it: {memory}"""
+
+
 async def reminder_message(user_id, it: schedule.Item, lead: str, now: datetime,
-                           recent: list[str] | None = None) -> str:
-    """The reminder in Violet's voice. Classes get one line of context: teammates and what's
-    due next for that course."""
-    facts = [schedule.reminder_text(it, lead)]
+                           recent: list[str] | None = None) -> View:
+    """Compact reminder view. Classes get one context line (teammates, what's due next)."""
+    context = None
     if it.kind in ("class", "class_session"):
         course = it.course or re.split(r"\s+-\s+", it.title)[0]
         upcoming = schedule.upcoming_for_course(user_id, course, now, limit=3)
-        if upcoming:
-            facts.append(f"Coming up for {course}: " + "; ".join(
-                f"{i.title}, {schedule.fmt_due(i)}" + (f" ({i.note})" if i.note else "") for i in upcoming))
-        ctx = await _context(user_id, f"Who are my teammates in {course}, and what have I noted about {course}?", 1200)
-        facts.append(f"What you know about {course}: {ctx}")
-        facts.append(
-            "Shape it like: \"OM with Jacoby in 30, 2 MetroTech. Heads up, your Chewy section is due Friday.\" "
-            "Short course name, professor if known, where, then ONE heads-up: the most useful thing coming up "
-            "(a group deliverable with teammates beats a routine one). Say deadlines like a person "
-            "(\"due at 2\", \"due Friday\"), no labels like \"Next due:\". Two short sentences max.")
-    return await voice.say(user_id, "\n".join(facts), kind="reminder", recent=recent)
+        try:
+            mem = await asyncio.wait_for(_context(user_id, f"Who are my teammates in {course}, and what have I noted about {course}?", 1200), 6)
+        except asyncio.TimeoutError:
+            mem = "nothing"
+        task = CONTEXT_TASK.format(
+            what=course,
+            upcoming="; ".join(f"{i.title}, {schedule.fmt_due(i)}" for i in upcoming) or "nothing",
+            memory=mem,
+        )
+        try:
+            line = (await voice.compose(user_id, task, recent, max_emoji=0)).splitlines()[0].strip()
+            line = re.split(r"(?<=[.!?])\s+", line)[0]  # one short line
+            context = None if not line or line.lower().strip(". ") == "none" else line
+        except Exception as e:
+            log.warning("reminder context failed (%s)", type(e).__name__)
+    return views.reminder_view(it, lead, context)
 
 
 # ---------- Events ----------
@@ -298,59 +266,39 @@ _EVENT_WORDS = re.compile(
     re.I,
 )
 
-PICKS_TASK = """It's {when}. Write his morning event picks, one message, best first.
-
-Events (facts to use; keep each link exactly as given):
-{facts}
-
-Shape, like this example:
-A couple worth your time this week.
-Startup Pitch Night at Leslie eLab, Thu 6:30 PM. Good fit for your credits pitch, lots of founders. You're free. https://...
-Wasserman fintech recruiting session, Fri 4 PM. Fits your Summer 2027 internship search. https://...
-Say 'going' to either and I'll add it to your calendar.
-
-One short lead-in line. Then one short paragraph per event, in the order given (best first): name and host or place, day and time, the
-why in a few words, "You're free" or the clash, a registration deadline if there is one, the price
-if it's paid, "needs approval, apply early" or "waitlist only" when flagged, then the link on the
-same line. Never write the words "last-minute" or "label". A "last-minute" event starts with "Heads up, this is <day>". A "you asked me to
-remind you" event says so briefly. End with one line on replying 'going', 'not for me', 'more like
-this' or 'remind me later' (short, natural)."""
-
-EVENTS_ANSWER_TASK = """He asked: "{question}"
-
-Relevant events (NYU Events and Luma) from {start} to {end}, best matches first (facts; keep links exactly):
-{facts}
-
-Answer from these only. Pick what fits the question (for example, career events, or what's at a
-place). One short line per event: name, day and time, place, a few words on why, the link. If none
-fit, say so plainly. Never invent events or links."""
-
-
 def is_event_question(text: str) -> bool:
     return bool(_EVENT_WORDS.search(text))
 
 
-def _ensure_links(text: str, items) -> str:
-    """Every event's link must be in the message; append any the model dropped."""
-    missing = [s.event.url for s in items if s.event.url and s.event.url not in text]
-    return text + ("\n" + "\n".join(missing) if missing else "")
+LEAD_TASK = """Write ONE short lead-in line (max 8 words) for his morning event picks. It's {today}.
+There {count} ({days}). Like "A couple worth your time this week." or "One worth grabbing a spot for."
+Match the count and the days. No emoji, no event names."""
 
 
-async def picks_message(user_id, picks, at: datetime, recent: list[str] | None = None) -> str:
-    import events  # local: events imports voice and schedule
-
-    facts = "\n".join(f"{n}. {events.fact_line(p)}" for n, p in enumerate(picks, 1))
-    task = PICKS_TASK.format(when=f"{at:%A %b} {at.day}, 9 AM", facts=facts)
+async def picks_message(user_id, picks, at: datetime, recent: list[str] | None = None) -> View:
+    """The 9 AM suggestions, rendered by code; the model only writes the lead-in line."""
     try:
-        text = await voice.compose(user_id, task, recent)
-    except Exception as e:
-        log.warning("picks message failed (%s)", type(e).__name__)
-        text = "A few events worth a look:\n" + "\n\n".join(events.list_line(p) for p in picks)
-    return _ensure_links(text, picks)
+        count = "is 1 event" if len(picks) == 1 else f"are {len(picks)} events"
+        days = ", ".join(f"{p.event.start:%A}" + (" next week" if (p.event.start.date() - at.date()).days >= 6 else "") for p in picks)
+        lead = (await voice.compose(user_id, LEAD_TASK.format(today=f"{at:%A}", count=count, days=days),
+                                    recent, max_emoji=0)).splitlines()[0]
+    except Exception:
+        lead = "A few worth your time."
+    return views.events_view(picks, at, lead=lead)
 
 
-async def answer_events(user_id, question: str, now: datetime | None = None, recent: list[str] | None = None) -> str:
-    """Questions about events, from the events table (lead times don't apply)."""
+EVENTS_PICK_TASK = """He asked: "{question}"
+
+Candidate events (NYU Events and Luma) from {start} to {end}, best matches first:
+{facts}
+
+Pick the ones that answer his question (for example, career events, AI hackathons, or what's at a
+place), at most 5, best first. Return JSON: {{"ids": ["..."], "lead": "one short line (max 10 words)"}}.
+If none fit, return an empty list and a lead that says so plainly."""
+
+
+async def answer_events(user_id, question: str, now: datetime | None = None, recent: list[str] | None = None) -> "str | View":
+    """Questions about events: the model picks which events fit, code renders them (with buttons)."""
     import events
 
     now = now or datetime.now(TZ)
@@ -360,16 +308,21 @@ async def answer_events(user_id, question: str, now: datetime | None = None, rec
     end = datetime.combine(end_d, datetime.max.time(), tzinfo=TZ)
     found = events.matches(user_id, start, end, min_score=30)[:25]
     if not found:
-        return await voice.say(user_id, f"No relevant NYU events found from {schedule.fmt_day(start_d)} to "
+        return await voice.say(user_id, f"No relevant events found from {schedule.fmt_day(start_d)} to "
                                         f"{schedule.fmt_day(end_d)}.", kind="answer", user_message=question, recent=recent)
-    facts = "\n".join(events.fact_line(s) for s in found)
-    task = EVENTS_ANSWER_TASK.format(question=question, start=schedule.fmt_day(start_d), end=schedule.fmt_day(end_d), facts=facts)
+    facts = "\n".join(f"id={s.event.id} | {events.fact_line(s)}" for s in found)
     try:
-        text = await voice.compose(user_id, task, recent, max_emoji=1)
+        data = await llm.chat_json([{"role": "user", "content": EVENTS_PICK_TASK.format(
+            question=question, start=schedule.fmt_day(start_d), end=schedule.fmt_day(end_d), facts=facts)}],
+            model_name=voice.voice_model())
     except Exception as e:
         log.warning("events answer failed (%s)", type(e).__name__)
         return FALLBACK
-    shown = [s.event.id for s in found if s.event.url and s.event.url in text]
-    if shown:
-        events.remember_list(user_id, shown)
-    return text
+    by_id = {s.event.id: s for s in found}
+    chosen = [by_id[i] for i in (data.get("ids") or []) if i in by_id][:5]
+    lead = voice.polish(str(data.get("lead") or ""), 0)
+    if not chosen:
+        return await voice.say(user_id, lead or "None of the upcoming events fit that.", kind="answer",
+                               user_message=question, recent=recent)
+    events.remember_list(user_id, [s.event.id for s in chosen])
+    return views.events_view(chosen, now, title="Events", lead=lead)

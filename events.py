@@ -206,7 +206,7 @@ Calibration:
 - A title starting with "DEADLINE:" is a sign-up deadline for a program; judge the program.
 - Boost in-person events in Brooklyn or Manhattan, Tandon, Stern, Wasserman, I-Hub, Leslie eLab.
 
-reason: one short line to him, always "you"/"your" (never his name or "his"). It must say what THIS
+reason: one short line to him, 14 words at most, always "you"/"your" (never his name or "his"). It must say what THIS
 event actually is (a dinner, a panel, a workshop, a hackathon...) and which specific thing of his it
 fits: a named project (Violet Memory, ScraperKast), a goal (VC, fintech or AI internships, founders),
 a course, or the Leslie eLab credits proposal. Write each reason fresh for its event; never reuse
@@ -552,6 +552,10 @@ def record_picks(user_id, day: date, picks: list[Scored], message: str | None, d
         for p in picks:
             _set_state(user_id, p.event.id, "suggested")
     _db.commit()
+
+
+def mark_suggested(user_id, event_id: str) -> None:
+    _set_state(user_id, event_id, "suggested")
 
 
 def picked_today(user_id, day: date) -> bool:
