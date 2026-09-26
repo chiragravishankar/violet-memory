@@ -783,21 +783,24 @@ def fmt_class_group(items: list[Item]) -> list[str]:
     return lines
 
 
-def week_view(user_id, days: int = 7, now: datetime | None = None) -> str:
+def agenda_lines(user_id, start: date, end: date, now: datetime | None = None,
+                 kinds: set[str] | None = None) -> list[str]:
+    """Everything from start to end (both days included, the last up to 11:59 PM), grouped
+    by day, in time order: weekly classes, class sessions, events and meetings, and
+    deadlines (📌) from every source. /week and schedule questions both use this."""
     now = now or datetime.now(TZ)
-    today = now.date()
-    items = existing_items(user_id)
+    items = [i for i in existing_items(user_id) if kinds is None or i.kind in kinds]
     lines = []
-    for n in range(days):
-        d = today + timedelta(days=n)
+    d = start
+    while d <= end:
         entries = []  # (sort key, line)
         for i in items:
-            if i.kind == "class" and i.weekday == d.weekday():
+            if i.kind == "class" and i.weekday == d.weekday() and d <= SEMESTER_END:
                 room = f", {i.room}" if i.room else ""
-                entries.append((i.start_time, f"  {fmt_time(i.start_time)} {i.course or i.title} class{room}"))
+                entries.append((i.start_time, f"  {fmt_time(i.start_time)} 🎓 {i.course or i.title} class{room}"))
             elif i.kind in ("event", "class_session") and i.due_date == d:
-                if i.due_time and n == 0 and due_datetime(i) < now:
-                    continue
+                if i.due_time and d == now.date() and due_datetime(i) < now:
+                    continue  # already over today
                 when = fmt_time(i.due_time) if i.due_time else "All day"
                 room = f", {i.room}" if i.room else ""
                 icon = "🎓 " if i.kind == "class_session" else ""
@@ -806,10 +809,75 @@ def week_view(user_id, days: int = 7, now: datetime | None = None) -> str:
                 when = fmt_time(i.due_time) if i.due_time else "any time"
                 lock = " 🔒" if i.note and "LockDown" in i.note else ""
                 entries.append((i.due_time or END_OF_DAY, f"  📌 {label(i)}, due {when}{lock}"))
-        if not entries:
-            continue
-        lines.append(("Today, " if n == 0 else "") + fmt_day(d))
-        lines += [line for _, line in sorted(entries, key=lambda e: e[0])]
+        if entries:
+            lines.append(("Today, " if d == now.date() else "") + fmt_day(d))
+            lines += [line for _, line in sorted(entries, key=lambda e: e[0])]
+        d += timedelta(days=1)
+    return lines
+
+
+def week_view(user_id, days: int = 7, now: datetime | None = None) -> str:
+    now = now or datetime.now(TZ)
+    lines = agenda_lines(user_id, now.date(), now.date() + timedelta(days=days - 1), now)
     if not lines:
         return f"Nothing on your calendar for the next {days} days 💜"
     return f"📅 Your next {days} days\n\n" + "\n".join(lines)
+
+
+# ---------- Date ranges and kinds in questions ----------
+
+CLASS_KINDS = {"class", "class_session"}
+_KIND_WORDS = [
+    (re.compile(r"\b(due|deadlines?|assignments?|homework|hw|exams?|quiz(zes)?|submit|submissions?)\b", re.I), DEADLINE_KINDS),
+    (re.compile(r"\b(meetings?|events?|calls?)\b", re.I), {"event"}),
+    (re.compile(r"\b(class|classes|lectures?|sessions?)\b", re.I), CLASS_KINDS),
+]
+
+
+def parse_kinds(text: str) -> set[str] | None:
+    """Which kinds of item a question is about ("what's due" -> deadlines), or None for all."""
+    kinds: set[str] = set()
+    for pattern, ks in _KIND_WORDS:
+        if pattern.search(text):
+            kinds |= ks
+    return kinds or None
+
+_DAY_WORDS = {
+    **{w: i for i, w in enumerate(WEEKDAYS)},
+    **{w[:3]: i for i, w in enumerate(WEEKDAYS[:5])},  # not "sat"/"sun": ordinary words
+    "tues": 1, "weds": 2, "thur": 3, "thurs": 3,
+}
+
+
+def parse_range(text: str, today: date) -> tuple[date, date, str] | None:
+    """(start, end, label) for the period a question asks about, in America/New_York.
+
+    today, tomorrow, a weekday (the next one, or today if it is that day), this week
+    (today through Sunday), next week (next Monday through Sunday), this weekend,
+    next N days (today plus the following N-1 days, like /week). None if no period is named."""
+    t = text.lower()
+    words = re.findall(r"[a-z]+|\d+", t)
+    m = re.search(r"next\s+(\d+)\s+days?", t)
+    if m:
+        n = max(1, min(int(m.group(1)), 60))
+        return today, today + timedelta(days=n - 1), f"the next {n} days"
+    if "next week" in t:
+        start = today + timedelta(days=7 - today.weekday())
+        return start, start + timedelta(days=6), "next week"
+    if "weekend" in t:
+        sat = today + timedelta(days=(5 - today.weekday()) % 7)
+        if today.weekday() == 6:
+            sat = today - timedelta(days=1)
+        return max(sat, today), sat + timedelta(days=1), "this weekend"
+    if "this week" in t or "rest of the week" in t:
+        return today, today + timedelta(days=6 - today.weekday()), "this week"
+    if "tomorrow" in words:
+        d = today + timedelta(days=1)
+        return d, d, "tomorrow"
+    for w in words:
+        if w in _DAY_WORDS:
+            d = today + timedelta(days=(_DAY_WORDS[w] - today.weekday()) % 7)
+            return d, d, f"{d:%A}"
+    if "today" in words or "tonight" in words:
+        return today, today, "today"
+    return None

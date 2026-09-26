@@ -4,7 +4,7 @@ the context line for class reminders. No channel code here."""
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import brain
 import llm
@@ -36,20 +36,36 @@ Message: \"\"\"{text}\"\"\""""
 ANSWER_PROMPT = """You are Violet Memory, a friendly personal memory assistant for a student.
 Now: {now} (America/New_York).
 
-Answer the question using the schedule below (it is authoritative for dates and times) and the
-memory notes. Resolve words like "tuesday", "tomorrow" or "next week" against now.
-If neither has the answer, say so briefly.
+The agenda below is COMPLETE for {period} ({start} to {end}) and already filtered to what the
+question asks about ({kinds}), from all their calendars. Answer from it:
+- List every agenda item. Never drop, merge, move or invent items.
+- Group by day, in date order, times in order within each day, like the agenda.
+- Mark deadlines with 📌 and classes with 🎓, as the agenda does.
+- Only the agenda counts as the schedule: never list dates or deadlines from the memory notes,
+  they can be about other periods or out of date.
+- If the agenda is empty, say so in one friendly line naming the period and its dates, then
+  list every "Coming up after" item (if any) under a short "Next up:" line.
+- Use the memory notes only to add a short helpful detail if relevant.
 
 Style: short and friendly, plain text only. No markdown, no asterisks, no em dashes.
-Use simple lines like "Tue Sep 29, 2:00 PM: How to Design Goods (Operations Management)" for lists.
 
-Schedule (next 21 days):
-{schedule}
+Agenda:
+{agenda}
+
+Coming up after (only for when nothing in the agenda matches):
+{after}
 
 Memory notes:
 {memory}
 
 Question: {question}"""
+
+_SCHEDULE_WORDS = re.compile(
+    r"\b(schedule|calendar|agenda|due|deadline|class|classes|lecture|meeting|meetings|exam|exams|"
+    r"quiz|assignment|assignments|homework|busy|free|plans?|week|today|tomorrow|tonight|weekend)\b",
+    re.I,
+)
+
 
 CONTEXT_PROMPT = """Write ONE short line (max 25 words) to add to a class reminder for {course}.
 Use only these facts. Mention teammates or people if the memory names any for this course, and the
@@ -84,18 +100,51 @@ async def classify(text: str) -> Classification:
 
 def _plain(text: str) -> str:
     text = text.replace("—", ", ").replace("–", "-").replace("**", "").replace("__", "")
-    return re.sub(r"^\s*#+\s*", "", text, flags=re.M).strip()
+    text = re.sub(r"^\s*#+\s*", "", text, flags=re.M)
+    return re.sub(r"[ \t]+$", "", text, flags=re.M).strip()
+
+
+def _kinds_label(kinds: set[str] | None) -> str:
+    if not kinds:
+        return "classes, meetings, events and deadlines"
+    names = []
+    if kinds & schedule.DEADLINE_KINDS:
+        names.append("deadlines")
+    if "event" in kinds:
+        names.append("meetings and events")
+    if kinds & schedule.CLASS_KINDS:
+        names.append("classes")
+    return " and ".join(names)
+
+
+def is_schedule_question(question: str, about_schedule: bool, today) -> bool:
+    return about_schedule or bool(_SCHEDULE_WORDS.search(question)) or schedule.parse_range(question, today) is not None
 
 
 async def answer(user_id, question: str, about_schedule: bool, now: datetime | None = None) -> str:
-    """Schedule questions use the schedule table and Cognee; others use Cognee alone."""
-    if not about_schedule:
-        return await brain.recall(user_id, question)
+    """Schedule questions: the same agenda as /week for the period the question names
+    (default the next 7 days), plus Cognee context. Other questions: Cognee alone."""
     now = now or datetime.now(TZ)
+    if not is_schedule_question(question, about_schedule, now.date()):
+        return await brain.recall(user_id, question)
+    start, end, period = schedule.parse_range(question, now.date()) or (
+        now.date(), now.date() + timedelta(days=6), "the next 7 days"
+    )
+    kinds = schedule.parse_kinds(question)
+    lines = schedule.agenda_lines(user_id, start, end, now, kinds)
+    # Only offered when the period is empty, so the answer can't wander past it.
+    after = [] if lines else schedule.agenda_lines(user_id, end + timedelta(days=1), end + timedelta(days=7), now, kinds)
+    log.info("schedule question: %s, %s to %s, kinds %s, %d agenda lines",
+             period, start, end, sorted(kinds) if kinds else "all", len(lines))
     memory = await brain.recall_raw(user_id, question)
     prompt = ANSWER_PROMPT.format(
         now=f"{now:%A %b} {now.day}, {now.year}, {schedule.fmt_time(now.time())}",
-        schedule=schedule.week_view(user_id, days=21, now=now),
+        period=period,
+        start=schedule.fmt_day(start),
+        end=schedule.fmt_day(end),
+        kinds=_kinds_label(kinds),
+        agenda="\n".join(lines) or "(nothing scheduled)",
+        after="\n".join(after) or "(nothing)",
         memory=memory or "none",
         question=question,
     )
