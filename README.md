@@ -85,6 +85,15 @@ previews what would fire at that moment.
 - Sensitive topics (health, finances, religion, politics, romantic life) are never stored,
   enforced in code, unless you explicitly ask ("remember that ...", or `/me edit`).
 - Quiet hours delay non-urgent reminders (1 week, 3 days, 1 day) to the end of them.
+- Everything saved to Cognee is anchored to the owner ("Chirag Ravishankar (the user)
+  wrote:"), so "I", "me" and "my" resolve to them and other names stay other people.
+  A name is only ever set from the user saying it, never guessed.
+- Questions about the user ("what's my name", "who am I", "what am I working on") are
+  answered from the profile first, then Cognee.
+- Corrections ("I am X", "my name is X", "actually ...", "no, ...") update the profile,
+  save the fix to Cognee and confirm.
+- Messages from one user that arrive within 3 seconds are joined, so a long paste that
+  Telegram splits is handled as one message (every text reply waits that long).
 
 ## Calendar feeds
 

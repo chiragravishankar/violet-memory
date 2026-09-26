@@ -125,12 +125,40 @@ def _norm(text: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
 
 
+def _person_name(f: dict) -> str:
+    """ "Peilin Li: teammate ..." -> "Peilin Li", when attrs has no name."""
+    name = f.get("attrs", {}).get("name")
+    if name:
+        return name
+    head = f["text"].split(":", 1)[0]
+    return head if ":" in f["text"] and len(head.split()) <= 5 else ""
+
+
+def dedupe_people(user_id) -> int:
+    """Merge duplicate entries for the same person. Returns how many were merged."""
+    data = get_profile(user_id)
+    kept, merged = [], 0
+    for f in data["people"]:
+        twin = next((k for k in kept if _norm(_person_name(k)) and _norm(_person_name(k)) == _norm(_person_name(f))), None)
+        if twin is None:
+            kept.append(f)
+            continue
+        extra = f["text"].split(":", 1)[-1].strip()
+        if not _near(twin["text"], f["text"]) and _norm(extra) not in _norm(twin["text"]):
+            twin["text"] = f"{twin['text']}; {extra}"
+        merged += 1
+    if merged:
+        data["people"] = kept
+        save_profile(user_id, data)
+    return merged
+
+
 def _same_fact(section: str, a: dict, b: dict) -> bool:
     ka, kb = a.get("attrs", {}).get("key"), b.get("attrs", {}).get("key")
     if ka and ka == kb and ka in SINGLE_KEYS:
         return True  # one name, one reply style, one set of quiet hours
     if section == "people":
-        na, nb = _norm(a.get("attrs", {}).get("name", "")), _norm(b.get("attrs", {}).get("name", ""))
+        na, nb = _norm(_person_name(a)), _norm(_person_name(b))
         if na and na == nb:
             return True
     ta, tb = _norm(a["text"]), _norm(b["text"])
@@ -158,6 +186,15 @@ def _strip_name(text: str, person: dict) -> str:
     return re.sub(rf"^{re.escape(name)}\s+", "", text, flags=re.I) if name else text
 
 
+def _flat_attrs(attrs, section: str) -> dict:
+    """The model sometimes nests attrs under the section name: {"identity": {"key": ...}}."""
+    attrs = dict(attrs or {})
+    for k in (section, *SECTIONS):
+        if isinstance(attrs.get(k), dict):
+            attrs = {**attrs.pop(k), **attrs}
+    return {k: v for k, v in attrs.items() if v not in (None, "") and not isinstance(v, dict)}
+
+
 def _clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", str(text)).strip().rstrip(".;")
     text = re.sub(r"^(my|i am|i'm)\s+", lambda m: "" if m.group(1).lower() == "my" else "", text, flags=re.I)
@@ -179,7 +216,9 @@ def add_facts(user_id, new: list[dict], source: str, stated: bool, confidence: f
             continue
         if section == "identity" and (nf.get("attrs") or {}).get("key") == "name" and (nf.get("attrs") or {}).get("value"):
             text = f"Name: {nf['attrs']['value']}"
-        attrs = {k: v for k, v in (nf.get("attrs") or {}).items() if v not in (None, "")}
+        attrs = _flat_attrs(nf.get("attrs"), section)
+        if attrs.get("key") == "name" and not stated:
+            continue  # never guess who the user is: names only come from the user saying so
         candidate = {"text": text, "attrs": attrs}
         existing = next((f for f in data[section] if _same_fact(section, f, candidate)), None)
         if existing is None and section != "people":
@@ -308,6 +347,29 @@ def quiet_until(user_id, now: datetime) -> datetime | None:
     return end_dt if end_dt > local else end_dt + timedelta(days=1)
 
 
+def owner_name(user_id) -> str | None:
+    """The user's name from the profile (only ever set from what they said)."""
+    for f in get_profile(user_id)["identity"]:
+        a = f.get("attrs", {})
+        if a.get("key") == "name" and f["stated_or_inferred"] == "stated":
+            return a.get("value") or re.sub(r"^name:\s*", "", f["text"], flags=re.I)
+    return None
+
+
+brain.set_owner_resolver(owner_name)
+
+
+def set_identity(user_id, name: str | None = None, **facts_by_key: str) -> list[dict]:
+    """Set core identity facts the user stated (name, program, location)."""
+    new = []
+    if name:
+        new.append({"section": "identity", "text": f"Name: {name}", "attrs": {"key": "name", "value": name}})
+    for key, text in facts_by_key.items():
+        section = "academics" if key == "program" else "identity"
+        new.append({"section": section, "text": text, "attrs": {"key": key}})
+    return add_facts(user_id, new, "chat", stated=True, confidence=1.0)
+
+
 def profile_summary(user_id, max_words: int = 150) -> str:
     """Compact text for prompts: who the user is, goals, people, preferences, patterns."""
     data = get_profile(user_id)
@@ -372,6 +434,8 @@ Regular routines count as lasting ("every Thursday", "usually", "on weekends"): 
 (kind routine), e.g. "Meets Hena on Thursday evenings to work on the OM project".
 Ignore one-off details (a single deadline, today's plans, a mood, an errand, a question they ask).
 Only return facts that are NEW or CHANGE what we already know; never repeat a known fact.
+Other people's names in the message are other people, never the user. Only give the user a name
+(identity key name) if they say it about themselves ("my name is ...", "I am ...", "I'm ...").
 {sensitive}
 Say "stated" if they say it about themselves directly, "inferred" if you are reading between lines.
 
@@ -449,10 +513,36 @@ async def extract_onboarding(user_id, question: str, answer: str) -> list[dict]:
     return add_facts(user_id, data.get("facts") or [], "onboarding", stated=True, confidence=1.0)
 
 
+SELF_DESCRIPTION = """The user wrote this about themselves (a pasted profile or self-introduction).
+Everything in it is stated by them. "I", "me" and "my" are the user; every other name is someone else
+(a teammate, professor, mentor, founder, ...), never the user.
+Extract their profile: identity (name with attrs key name and value, location, background),
+academics (program, courses with professors), goals (career goals, each named project), people
+(one fact per person with name and relationship), preferences, patterns. {sensitive}
+Already known (do not repeat, only new or changed):
+{known}
+{schema}
+Return JSON: {{"facts": [...]}}.
+
+{text}"""
+
+
+async def seed_from_self_description(user_id, text: str) -> list[dict]:
+    data = await llm.chat_json([{"role": "user", "content": SELF_DESCRIPTION.format(
+        text=text[:15000], sensitive=SENSITIVE_RULE, schema=_schema(), known=_listing(user_id))}])
+    return add_facts(user_id, data.get("facts") or [], "chat", stated=True, confidence=0.95)
+
+
+def looks_like_self_description(text: str) -> bool:
+    return len(text) > 600 and bool(re.search(r"\b(about me|my profile|i am|i'm|my name|myself)\b", text, re.I))
+
+
 async def learn(user_id, text: str) -> list[dict]:
     """Background check after each message: store lasting facts, ignore one-offs."""
     if len(text.split()) < 3:
         return []
+    if looks_like_self_description(text):
+        return await seed_from_self_description(user_id, text)
     data = await llm.chat_json([{"role": "user", "content": LEARN_PROMPT.format(
         text=text, known=_known(user_id), sensitive=SENSITIVE_RULE, schema=_schema())}])
     found = data.get("facts") or []
@@ -509,9 +599,18 @@ async def edit(user_id, instruction: str) -> list[str]:
         elif kind == "update":
             data = get_profile(user_id)
             s, f = find_fact(data, str(op.get("id")))
+            new_attrs = _flat_attrs(op.get("attrs"), s)
+            if f and s != "identity" and (new_attrs.get("key") == "name" or str(op.get("text", "")).lower().startswith("name:")):
+                # Never turn someone else's entry into the user's name: add it to identity instead.
+                name = new_attrs.get("value") or re.sub(r"^name:\s*", "", str(op["text"]), flags=re.I).strip()
+                for nf in set_identity(user_id, name=name):
+                    done.append(f"Updated: {nf['text']}")
+                continue
             if f and op.get("text"):
-                f["text"] = str(op["text"]).strip()
-                f["attrs"] = {**f.get("attrs", {}), **(op.get("attrs") or {})}
+                f["attrs"] = {**f.get("attrs", {}), **new_attrs}
+                f["text"] = _clean_text(op["text"])
+                if f["attrs"].get("key") == "name" and f["attrs"].get("value"):
+                    f["text"] = f"Name: {f['attrs']['value']}"
                 f.update(stated_or_inferred="stated", source="chat", confidence=1.0, last_confirmed=_now())
                 save_profile(user_id, data)
                 done.append(f"Updated: {f['text']}")

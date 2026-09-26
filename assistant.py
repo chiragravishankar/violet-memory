@@ -14,7 +14,7 @@ from schedule import TZ
 
 log = logging.getLogger("assistant")
 
-QUESTION, SCHEDULE, MEMORY = "question", "schedule", "memory"
+QUESTION, SCHEDULE, MEMORY, CORRECTION = "question", "schedule", "memory", "correction"
 
 CLASSIFY_PROMPT = """Classify a message a student sent to their personal memory assistant.
 
@@ -25,12 +25,15 @@ Types:
   exam, class, meeting or event ("Chewy draft due next Friday 11:59pm", "OM exam on Oct 12").
 - "memory": a fact, person, idea or note to remember with nothing to schedule
   ("Met Sam at the Leslie mixer, he builds climate tools").
+- "correction": they are correcting something about themselves or something you said:
+  "I am X", "my name is X", "actually ...", "no, ...", "that's wrong, ...", "bro, i am chirag".
 
 If you are unsure between question and memory, choose question.
 Also say whether the message is about their schedule (deadlines, classes, events, days, what is due),
-which matters for questions.
+and whether a question is about the user themself or their own life (their name, who they are,
+what they study, their courses, projects, goals, the people in their life, their preferences).
 
-Return JSON: {{"type": "question|schedule|memory", "about_schedule": true|false}}
+Return JSON: {{"type": "question|schedule|memory|correction", "about_schedule": true|false, "about_user": true|false}}
 
 Message: \"\"\"{text}\"\"\""""
 
@@ -108,6 +111,7 @@ Memory about this course: {memory}"""
 class Classification:
     type: str
     about_schedule: bool
+    about_user: bool = False
 
 
 def _fallback(text: str) -> Classification:
@@ -121,9 +125,18 @@ async def classify(text: str) -> Classification:
         log.warning("classify failed (%s), using fallback", type(e).__name__)
         return _fallback(text)
     kind = str(data.get("type", "")).lower()
-    if kind not in (QUESTION, SCHEDULE, MEMORY):
+    if kind not in (QUESTION, SCHEDULE, MEMORY, CORRECTION):
         return _fallback(text)
-    return Classification(kind, bool(data.get("about_schedule")))
+    if kind != CORRECTION and _CORRECTION.match(text):
+        kind = CORRECTION  # "my name is X" / "actually, ..." even if the model missed it
+    return Classification(kind, bool(data.get("about_schedule")), bool(data.get("about_user")))
+
+
+_CORRECTION = re.compile(
+    r"^\s*(bro,?\s*|dude,?\s*)?(my name is|i am\b(?! (going|gonna|meeting|at|in|on|free|busy|done|not sure|working on|taking|looking|trying|so|very|really|tired|feeling))|"
+    r"i'm\s+[A-Z]\w+\s+[A-Z]\w+|actually\b|no,|nope,|that's wrong|thats wrong|wrong,)",
+    re.I,
+)
 
 
 def _plain(text: str) -> str:
@@ -158,12 +171,81 @@ def is_schedule_question(question: str, about_schedule: bool, today) -> bool:
     return about_schedule or bool(_SCHEDULE_WORDS.search(question)) or schedule.parse_range(question, today) is not None
 
 
-async def answer(user_id, question: str, about_schedule: bool, now: datetime | None = None) -> str:
+ABOUT_USER_PROMPT = """You are Violet Memory, a friendly personal memory assistant. The person asking is the user.
+
+Their profile (authoritative: what they told you about themselves):
+{profile}
+
+Memory search result (can mix people up; if it conflicts with the profile, the profile wins,
+and any other name in it is someone else, not the user):
+{memory}
+
+Question: {question}
+
+Answer from the profile first, then the memory result. Talk to them as "you". If neither has the
+answer, say so and suggest /me setup. Plain text, no markdown, no em dashes, short unless their
+reply style preference says detailed."""
+
+
+async def answer_about_user(user_id, question: str) -> str:
+    listing = "\n".join(f"- [{s}] {f['text']}" for s, f in selfmodel.facts(selfmodel.get_profile(user_id))) or "(empty)"
+    memory = await brain.recall_raw(user_id, question, system_prompt=memory_system_prompt(
+        selfmodel.profile_summary(user_id) or "unknown"))
+    prompt = ABOUT_USER_PROMPT.format(profile=listing, memory=memory or "none", question=question)
+    return _plain(await llm.chat([{"role": "user", "content": prompt}]))
+
+
+_NAME = re.compile(
+    r"^\s*(?:bro,?\s*|dude,?\s*|no,?\s*|actually,?\s*)*(?:my name is|i am|i'm|im|call me)\s+"
+    r"([A-Za-z][A-Za-z'-]+(?:\s+[A-Za-z][A-Za-z'-]+){0,3})\s*[.!]*\s*$",
+    re.I,
+)
+
+
+_NOT_NAME_WORDS = {
+    "a", "an", "the", "to", "at", "in", "on", "of", "for", "from", "with", "and", "not", "so", "very", "really",
+    "here", "there", "back", "home", "sure", "fine", "ok", "okay", "good", "great", "happy", "sad", "sorry",
+    "ready", "late", "early", "tired", "busy", "free", "done", "sick", "gym", "student", "class", "work",
+    "school", "bored", "hungry", "confused", "lost", "stuck", "new", "just", "still", "also", "your", "you",
+}
+
+
+def _looks_like_name(candidate: str) -> bool:
+    words = candidate.lower().split()
+    return (
+        1 <= len(words) <= 4
+        and not any(w in _NOT_NAME_WORDS for w in words)
+        and not words[0].endswith(("ing", "ed"))
+    )
+
+
+async def correct(user_id, text: str, last_reply: str | None = None) -> str:
+    """Apply a correction: update the profile, save the corrected fact to memory, confirm."""
+    m = _NAME.match(text)
+    if m and _looks_like_name(m.group(1)):
+        # "i am chirag ravishankar": set the name directly, no model involved.
+        name = " ".join(w[:1].upper() + w[1:] for w in m.group(1).split())
+        selfmodel.set_identity(user_id, name=name)
+        await brain.save(user_id, f"My name is {name}.", kind="correction")
+        return f"Fixed 💜 Your name is {name}. I'll remember that."
+    instruction = text if not last_reply else f'You had just said: "{last_reply[:300]}". The user replied: "{text}"'
+    changes = await selfmodel.edit(user_id, instruction)
+    fact = "; ".join(changes) if changes else text
+    await brain.save(user_id, fact if changes else text, kind="correction")
+    if changes:
+        return "Fixed 💜\n" + "\n".join(changes)
+    return "Thanks for the correction, noted 💜"
+
+
+async def answer(user_id, question: str, about_schedule: bool, now: datetime | None = None,
+                 about_user: bool = False) -> str:
     """Schedule questions: the same agenda as /week for the period the question names
     (default the next 7 days), plus Cognee context. Other questions: Cognee alone."""
     now = now or datetime.now(TZ)
     profile = selfmodel.profile_summary(user_id) or "nothing yet"
     advice = bool(_ADVICE.search(question))
+    if about_user and not advice and not about_schedule:
+        return await answer_about_user(user_id, question)
     if not advice and not is_schedule_question(question, about_schedule, now.date()):
         return await brain.recall(user_id, question, system_prompt=memory_system_prompt(profile))
     start, end, period = schedule.parse_range(question, now.date()) or (

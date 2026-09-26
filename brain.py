@@ -35,10 +35,33 @@ def is_connecting(user_id: int | str) -> bool:
     return _pending[dataset_for(user_id)] > 0
 
 
-async def save(user_id: int | str, text: str) -> None:
-    """Store raw text in the user's dataset. Fast; call connect() afterwards."""
+# Resolves a user id to the owner's name (set by selfmodel, which knows the profile).
+_owner_name = lambda user_id: None  # noqa: E731
+
+
+def set_owner_resolver(fn) -> None:
+    global _owner_name
+    _owner_name = fn
+
+
+def anchor(user_id: int | str, text: str, kind: str = "message") -> str:
+    """Prefix text so the graph knows who "I", "me" and "my" are, and that other names
+    are other people. kind: message, document, calendar, correction."""
+    name = _owner_name(user_id)
+    who = f"{name} (the user)" if name else "The user"
+    head = {
+        "message": f"{who} wrote:",
+        "document": f"{who} shared this document:",
+        "calendar": f"From the calendar of {who}:",
+        "correction": f"Correction from {who}, this replaces anything that said otherwise:",
+    }[kind]
+    return f"{head}\n{text}"
+
+
+async def save(user_id: int | str, text: str, kind: str = "message") -> None:
+    """Store text in the user's dataset, anchored to the user. Fast; call connect() afterwards."""
     ds = dataset_for(user_id)
-    await cognee.add(text, dataset_name=ds)
+    await cognee.add(anchor(user_id, text, kind), dataset_name=ds)
     _known.add(ds)
 
 
@@ -134,7 +157,7 @@ def _first_text(results) -> str:
 
 
 # Items in memory that /forget must never delete wholesale: files and calendar summaries.
-_BULK_PREFIXES = ("Document:", "New items from my", "Core profile of")
+_BULK_MARKERS = ("shared this document:", "From the calendar of", "Document:", "New items from my", "Core profile of")
 
 
 async def forget_text(user_id: int | str, text: str) -> int:
@@ -155,7 +178,7 @@ async def forget_text(user_id: int | str, text: str) -> int:
             content = Path(str(d.raw_data_location).replace("file://", "")).read_text(errors="replace")
         except Exception:
             continue
-        if content.startswith(_BULK_PREFIXES) or needle not in content.lower():
+        if any(m in content[:300] for m in _BULK_MARKERS) or needle not in content.lower():
             continue
         try:
             await cognee.datasets.delete_data(ds.id, d.id)

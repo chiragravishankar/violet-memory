@@ -64,18 +64,31 @@ if "classification" not in {r[1] for r in _db.execute("PRAGMA table_info(message
 _db.commit()
 
 
-def log_message(direction: str, update: Update, text: str | None, classification: str | None = None) -> None:
+def log_message(direction: str, update: Update, text: str | None, classification: str | None = None) -> int:
     user = update.effective_user
     chat = update.effective_chat
-    log_raw(direction, user.id if user else None, chat.id if chat else None, text, classification)
+    return log_raw(direction, user.id if user else None, chat.id if chat else None, text, classification)
 
 
-def log_raw(direction: str, user_id, chat_id, text: str | None, classification: str | None = None) -> None:
-    _db.execute(
+def log_raw(direction: str, user_id, chat_id, text: str | None, classification: str | None = None) -> int:
+    cur = _db.execute(
         "INSERT INTO messages (ts, direction, user_id, chat_id, text, classification) VALUES (?, ?, ?, ?, ?, ?)",
         (datetime.now(timezone.utc).isoformat(), direction, user_id, chat_id, text, classification),
     )
     _db.commit()
+    return cur.lastrowid
+
+
+def set_classification(row_ids: list[int], label: str) -> None:
+    _db.executemany("UPDATE messages SET classification = ? WHERE id = ?", [(label, r) for r in row_ids])
+    _db.commit()
+
+
+def last_reply(user_id) -> str | None:
+    row = _db.execute(
+        "SELECT text FROM messages WHERE user_id = ? AND direction = 'out' ORDER BY id DESC LIMIT 1", (int(user_id),)
+    ).fetchone()
+    return row[0] if row else None
 
 
 async def reply(update: Update, text: str) -> None:
@@ -126,14 +139,47 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply(update, f"Removed {count} item{'s' if count != 1 else ''} added from {label} 💜")
 
 
+# Telegram splits long pastes into several messages. Messages from one user that arrive
+# within this many seconds of each other are joined and handled as one.
+BUFFER_SECONDS = 3.0
+_buffers: dict[int, dict] = {}
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.effective_message.text.strip()
+    text = update.effective_message.text
+    user_id = update.effective_user.id
+    row = log_message("in", update, text)
+    await update.effective_chat.send_action(ChatAction.TYPING)
+    buf = _buffers.setdefault(user_id, {"parts": [], "rows": []})
+    buf["parts"].append(text)
+    buf["rows"].append(row)
+    buf["update"] = update
+    if buf.get("task"):
+        buf["task"].cancel()  # still waiting: restart the quiet window
+    buf["task"] = context.application.create_task(_flush_later(user_id, context), update=update)
+
+
+async def _flush_later(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await asyncio.sleep(BUFFER_SECONDS)
+    except asyncio.CancelledError:
+        return
+    buf = _buffers.pop(user_id, None)  # no await between the sleep and here: nothing can slip in
+    if not buf:
+        return
+    text = "\n".join(p.strip() for p in buf["parts"]).strip()
+    if len(buf["parts"]) > 1:
+        log.info("joined %d messages (%d chars) from %s", len(buf["parts"]), len(text), user_id)
+    await handle_text(buf["update"], context, text, buf["rows"])
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, rows: list[int]) -> None:
     user_id = update.effective_user.id
     await update.effective_chat.send_action(ChatAction.TYPING)
 
     # Conversations in progress about the profile take the message first.
     if onboarding.is_active(user_id):
-        log_message("in", update, text, "onboarding")
+        set_classification(rows, "onboarding")
         answer, finished = await _with_typing(update, context, onboarding.handle(user_id, text))
         await reply(update, answer)
         if finished:
@@ -142,24 +188,33 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     m = selfmodel.meta(user_id)
     if m.get("awaiting_edit"):
         selfmodel.set_meta(user_id, awaiting_edit=False)
-        log_message("in", update, text, "profile_edit")
+        set_classification(rows, "profile_edit")
         await reply(update, await _with_typing(update, context, _apply_edit(user_id, text)))
         return
     if m.get("awaiting_answer") and selfmodel.next_question(user_id):
-        log_message("in", update, text, "reflection_answer")
+        set_classification(rows, "reflection_answer")
         await reply(update, await _reflection_reply(update, context, user_id, text))
         return
 
     c = await assistant.classify(text)
-    label = c.type + ("+schedule" if c.about_schedule else "")
+    label = c.type + ("+schedule" if c.about_schedule else "") + ("+about_user" if c.about_user else "")
     log.info("classified %r as %s", text[:80], label)
-    log_message("in", update, text, label)
+    set_classification(rows, label)
+
+    if c.type == assistant.CORRECTION:
+        answer = await _with_typing(update, context, assistant.correct(user_id, text, last_reply(user_id)))
+        await reply(update, answer)
+        context.application.create_task(brain.connect(user_id), update=update)
+        context.application.create_task(sync_profile(user_id))
+        return
 
     # Learn lasting facts in the background; never slows the reply.
     context.application.create_task(_learn(user_id, text))
 
     if c.type == assistant.QUESTION:
-        answer = await _with_typing(update, context, assistant.answer(user_id, text, c.about_schedule))
+        answer = await _with_typing(
+            update, context, assistant.answer(user_id, text, c.about_schedule, about_user=c.about_user)
+        )
         await reply(update, answer)
         return
 

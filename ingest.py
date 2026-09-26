@@ -34,7 +34,7 @@ async def process_file(user_id, path: Path, file_name: str, caption: str | None)
     if not extracted.text.strip():
         return f"I couldn't find any text in {name} 💜"
 
-    await brain.save(user_id, brain.document_memory(file_name, caption, extracted.text))
+    await brain.save(user_id, brain.document_memory(file_name, caption, extracted.text), kind="document")
     pages = f" ({_plural(extracted.pages, 'page')})" if extracted.pages else ""
 
     if await selfmodel.is_resume(extracted.text, caption, file_name):

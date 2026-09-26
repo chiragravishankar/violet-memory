@@ -247,7 +247,7 @@ async def sync_feed(feed: Feed, user_id: str) -> schedule.SyncResult | None:
         items = parse_brightspace(data)
     result = schedule.sync_events(user_id, items, feed.source)
     if result.added:
-        await brain.save(user_id, memory_summary(feed.source, result.added))
+        await brain.save(user_id, memory_summary(feed.source, result.added), kind="calendar")
     log.info(
         "%s sync: %d in feed, %d new, %d already there (%d taken over from PDF/chat, %d dates corrected), "
         "%d updated, %d removed",
