@@ -47,13 +47,13 @@ async def process_file(user_id, path: Path, file_name: str, caption: str | None)
 
 
 async def process_chat(user_id, text: str) -> str | None:
-    """Look for deadlines or classes in a chat message. Returns a reply only if any were added."""
-    items = await schedule.extract(text, "a chat message from the user")
+    """Add deadlines or classes from a chat message. Returns the reply, or None if none were found."""
+    items = await schedule.extract(text, "a chat message from the user", allow_relative=True)
     if not items:
         return None
     result = schedule.add_items(user_id, items, source="chat", label=text[:60])
     if not result.added:
-        return None
+        return "That's already in your calendar 💜" if result.duplicates else None
     return "\n".join(summarize(result, skipped_lines=False))
 
 

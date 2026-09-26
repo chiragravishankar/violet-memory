@@ -68,6 +68,20 @@ def document_memory(file_name: str, caption: str | None, text: str) -> str:
     return "\n".join(header) + "\n\n" + text
 
 
+async def recall_raw(user_id: int | str, question: str) -> str:
+    """Cognee's answer from this user's memories, or "" if there is none or search fails."""
+    try:
+        results = await cognee.search(
+            query_text=question,
+            query_type=SearchType.GRAPH_COMPLETION,
+            datasets=[dataset_for(user_id)],
+        )
+    except Exception as e:
+        log.info("search failed for %s: %s", dataset_for(user_id), type(e).__name__)
+        return ""
+    return _first_text(results)
+
+
 async def recall(user_id: int | str, question: str) -> str:
     """Answer a question using only this user's memories."""
     ds = dataset_for(user_id)

@@ -11,9 +11,10 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+import assistant
 import brain  # loads .env
 import docs
-import gcal
+import feeds
 import ingest
 import schedule
 
@@ -30,7 +31,8 @@ HELP = (
     + "\n\nSend me a PDF, Word file, text file or photo (like a syllabus or a class "
     "schedule screenshot) and I'll save it and add its deadlines. Add a caption like "
     "\"OM syllabus\" so I know what it is.\n\n"
-    "/week shows your next 7 days.\n/undo removes the deadlines from your last file."
+    "/week shows your next 7 days.\n/undo removes the deadlines from your last file.\n"
+    "/demo_time 2026-09-29 13:30 shows the reminders that would fire at that time."
 )
 FILE_TYPES = "I can read PDF, Word (.docx), .txt, .md and photos for now 💜"
 TOO_BIG = "That file is over 20 MB, which is more than Telegram lets me download. Could you send a smaller version? 💜"
@@ -53,25 +55,21 @@ _db.execute(
         text TEXT
     )"""
 )
+if "classification" not in {r[1] for r in _db.execute("PRAGMA table_info(messages)")}:
+    _db.execute("ALTER TABLE messages ADD COLUMN classification TEXT")  # question, schedule, memory
 _db.commit()
 
 
-def log_message(direction: str, update: Update, text: str | None) -> None:
+def log_message(direction: str, update: Update, text: str | None, classification: str | None = None) -> None:
     user = update.effective_user
     chat = update.effective_chat
-    log_raw(direction, user.id if user else None, chat.id if chat else None, text)
+    log_raw(direction, user.id if user else None, chat.id if chat else None, text, classification)
 
 
-def log_raw(direction: str, user_id, chat_id, text: str | None) -> None:
+def log_raw(direction: str, user_id, chat_id, text: str | None, classification: str | None = None) -> None:
     _db.execute(
-        "INSERT INTO messages (ts, direction, user_id, chat_id, text) VALUES (?, ?, ?, ?, ?)",
-        (
-            datetime.now(timezone.utc).isoformat(),
-            direction,
-            user_id,
-            chat_id,
-            text,
-        ),
+        "INSERT INTO messages (ts, direction, user_id, chat_id, text, classification) VALUES (?, ?, ?, ?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(), direction, user_id, chat_id, text, classification),
     )
     _db.commit()
 
@@ -127,11 +125,14 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.effective_message.text.strip()
     user_id = update.effective_user.id
-    log_message("in", update, text)
+    await update.effective_chat.send_action(ChatAction.TYPING)
+    c = await assistant.classify(text)
+    label = c.type + ("+schedule" if c.about_schedule else "")
+    log.info("classified %r as %s", text[:80], label)
+    log_message("in", update, text, label)
 
-    if text.endswith("?"):
-        await update.effective_chat.send_action(ChatAction.TYPING)
-        answer = await _with_typing(update, context, brain.recall(user_id, text))
+    if c.type == assistant.QUESTION:
+        answer = await _with_typing(update, context, assistant.answer(user_id, text, c.about_schedule))
         await reply(update, answer)
         return
 
@@ -141,20 +142,37 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("save failed")
         await reply(update, "Sorry, I couldn't save that. Please try again 💜")
         return
-    await reply(update, SAVED)
     context.application.create_task(brain.connect(user_id), update=update)
-    context.application.create_task(_chat_schedule(update, context, user_id, text), update=update)
 
-
-async def _chat_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str) -> None:
-    """Pick deadlines or class times out of a saved chat message, in the background."""
-    try:
-        note = await ingest.process_chat(user_id, text)
-    except Exception:
-        log.exception("chat schedule extraction failed")
+    if c.type == assistant.SCHEDULE:
+        try:
+            note = await _with_typing(update, context, ingest.process_chat(user_id, text))
+        except Exception:
+            log.exception("chat schedule extraction failed")
+            note = None
+        await reply(update, note or SAVED)
         return
-    if note:
-        await reply(update, note)
+    await reply(update, SAVED)
+
+
+async def demo_time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/demo_time 2026-09-29 13:30: show the reminders that would fire at that moment."""
+    log_message("in", update, inbound_text(update))
+    try:
+        at = datetime.strptime(" ".join(context.args[:2]), "%Y-%m-%d %H:%M").replace(tzinfo=schedule.TZ)
+    except ValueError:
+        await reply(update, "Try it like this: /demo_time 2026-09-29 13:30")
+        return
+    await reply(update, await _with_typing(update, context, demo_time(update.effective_user.id, at)))
+
+
+async def demo_time(user_id, at: datetime) -> str:
+    head = f"🕒 Pretending it's {schedule.fmt_day(at.date())}, {schedule.fmt_time(at.time())}"
+    due = schedule.preview_reminders(user_id, at)
+    if not due:
+        return head + "\n\nNo reminders at that time 💜"
+    texts = [await assistant.reminder_message(user_id, it, lead, at) for it, lead in due]
+    return head + "\n\n" + "\n\n".join(texts)
 
 
 async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -223,10 +241,14 @@ async def _with_typing(update: Update, context: ContextTypes.DEFAULT_TYPE, coro)
 
 
 async def send_reminders(app: Application) -> None:
-    """Every 30 seconds, send reminders that are due. Private chat id == user id."""
+    """Every 30 seconds, send reminders that are due. Private chat id == user id.
+    Each reminder is marked sent before sending, so restarts never repeat one."""
     while True:
         try:
-            for user_id, text in schedule.pop_due_reminders():
+            schedule.ensure_class_reminders()
+            now = datetime.now(schedule.TZ)
+            for user_id, item, lead in schedule.pop_due_reminders(now):
+                text = await assistant.reminder_message(user_id, item, lead, now)
                 await app.bot.send_message(chat_id=int(user_id), text=text)
                 log_raw("out", int(user_id), int(user_id), text)
         except Exception:
@@ -234,26 +256,19 @@ async def send_reminders(app: Application) -> None:
         await asyncio.sleep(30)
 
 
-async def sync_google(app: Application) -> None:
-    """Sync the Google Calendar feed now and every 3 hours. Never logs the feed URL."""
+async def sync_feeds(app: Application) -> None:
+    """Sync Brightspace and Google Calendar now and every 3 hours. Never logs feed URLs."""
     while True:
-        cfg = gcal.configured()
-        if cfg:
-            url, user_id = cfg
-            try:
-                result = await gcal.sync(user_id, url)
-                if result.added:
-                    app.create_task(brain.connect(user_id))
-            except gcal.FeedError as e:
-                log.warning("google sync failed: %s", e)
-            except Exception as e:
-                log.warning("google sync failed: %s", type(e).__name__)
-        await asyncio.sleep(gcal.SYNC_EVERY.total_seconds())
+        results = await feeds.sync_all()
+        if any(not isinstance(r, str) and r.added for r in results.values()):
+            app.create_task(brain.connect(feeds.calendar_user()))
+        await asyncio.sleep(feeds.SYNC_EVERY.total_seconds())
 
 
 async def post_init(app: Application) -> None:
+    schedule.plan_all_reminders()
     app.create_task(send_reminders(app))
-    app.create_task(sync_google(app))
+    app.create_task(sync_feeds(app))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -275,6 +290,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("week", week_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
+    app.add_handler(CommandHandler("demo_time", demo_time_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, on_other))

@@ -8,6 +8,9 @@ with `?` and it answers from your memories. Each user's memory is private.
 - `docs.py`: text from PDF, Word, .txt/.md and images (OpenAI vision for photos and scanned PDFs).
 - `schedule.py`: deadline and class extraction, dedupe, reminders, week view (SQLite `data/violet.db`).
 - `ingest.py`: file and chat pipelines that tie the above together.
+- `assistant.py`: classifies each message (question, schedule item, memory), answers
+  schedule questions from the calendar plus Cognee, builds class reminder context.
+- `feeds.py`: Brightspace and Google Calendar iCal sync (now and every 3 hours).
 - `data/`: created on first run. Holds Cognee's databases and `messages.db`
   (SQLite log of every inbound and outbound message).
 
@@ -57,9 +60,22 @@ Open your bot in Telegram and send `/start`.
 Send a PDF, .docx, .txt, .md or photo (max 20 MB), ideally with a caption like
 "OM syllabus". It is saved to `data/files/<user_id>/`, added to memory, and any
 dated deadlines or weekly class times are added to your calendar (Fall 2026,
-America/New_York). Deadlines remind you 1 day and 2 hours before; exams also
-1 week before. `/week` shows the next 7 days, `/undo` removes items from your
+America/New_York). `/week` shows the next 7 days, `/undo` removes items from your
 last file.
+
+Reminders: assignments 3 days, 1 day and 3 hours before (exams also 1 week);
+classes 30 minutes before with a line of context from memory; other timed events
+1 hour before; all-day events none. LockDown Browser items say so. Reminders are
+marked sent before sending, so restarts never repeat one, and reminders missed
+while the bot was off for over an hour are dropped. `/demo_time 2026-09-29 13:30`
+previews what would fire at that moment.
+
+## Calendar feeds
+
+Set `BRIGHTSPACE_ICS_URL`, `GOOGLE_ICS_URL` and `CALENDAR_USER_ID` (your Telegram
+user id) in `.env`. Feed URLs are secrets: they are never logged, and sync errors
+only report the error type. Brightspace items that match ones from an uploaded PDF
+take them over, so nothing is duplicated.
 
 Only one process can use the Cognee database at a time, so stop the bot before
 running scripts that import `brain.py`.

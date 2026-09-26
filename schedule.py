@@ -21,6 +21,9 @@ SEMESTER_START = date(2026, 8, 24)  # generous bounds: anything outside is rejec
 SEMESTER_END = date(2027, 1, 15)
 
 DEADLINE_KINDS = {"assignment", "exam", "quiz", "project", "deadline"}
+# Timed, non-deadline kinds: "class" is a weekly syllabus meeting (weekday + time),
+# "class_session" a dated class occurrence (from a calendar), "event" anything else.
+TIMED_KINDS = {"class", "class_session", "event"}
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 END_OF_DAY = time(23, 59)
 
@@ -68,8 +71,13 @@ _db.executescript(
     );
     """
 )
-if "uid" not in {r["name"] for r in _db.execute("PRAGMA table_info(items)")}:
-    _db.execute("ALTER TABLE items ADD COLUMN uid TEXT")  # calendar event UID (Google sync)
+_cols = {r["name"] for r in _db.execute("PRAGMA table_info(items)")}
+if "uid" not in _cols:
+    _db.execute("ALTER TABLE items ADD COLUMN uid TEXT")  # calendar feed UID
+if "note" not in _cols:
+    _db.execute("ALTER TABLE items ADD COLUMN note TEXT")
+# One row per item, lead and time: re-planning after a restart can never duplicate a reminder.
+_db.execute("CREATE UNIQUE INDEX IF NOT EXISTS reminders_once ON reminders (item_id, lead, remind_at)")
 _db.commit()
 
 
@@ -79,7 +87,7 @@ EXTRACT_PROMPT = """You extract schedule items for a student. Semester: {semeste
 Today is {today}.
 
 Context: {context}
-
+{relative}
 Return JSON: {{"items": [ ... ]}}. Each item is one of:
 
 Deadline (assignment, exam, quiz, project milestone, other deadline):
@@ -126,6 +134,8 @@ class Item:
     id: int | None = None
     uid: str | None = None  # calendar event UID, per occurrence for recurring events
     series_uid: str | None = None  # recurring series UID (not stored)
+    source: str | None = None  # file, chat, brightspace, google
+    note: str | None = None  # e.g. "Needs LockDown Browser"
 
 
 @dataclass
@@ -153,14 +163,36 @@ def chunk_text(text: str) -> list[str]:
     return chunks
 
 
-async def extract(text: str, context: str = "") -> list[Item]:
-    """Run LLM extraction over every chunk of text and return validated items."""
+RELATIVE_RULES = """Relative dates are allowed in this message. Resolve them with this calendar
+(first line is today): {days}
+"this <weekday>" or "next <weekday>" or a bare weekday = the first such day after today.
+"tomorrow" = the day after today. "next week <weekday>" = that weekday in the following week.
+"""
+
+
+def _relative_ok(d: date, evidence: str, today: date) -> bool:
+    """A relative date in a chat message ("next Friday", "tomorrow") matches the resolved day."""
+    ev = evidence.lower()
+    delta = (d - today).days
+    if "tomorrow" in ev:
+        return delta == 1
+    if "today" in ev or "tonight" in ev:
+        return delta == 0
+    day_names = [w for w in WEEKDAYS if w in ev or w[:3] in re.findall(r"[a-z]+", ev)]
+    return bool(day_names) and d.weekday() == WEEKDAYS.index(day_names[0]) and 0 < delta <= 14
+
+
+async def extract(text: str, context: str = "", allow_relative: bool = False) -> list[Item]:
+    """Run LLM extraction over every chunk of text and return validated items.
+
+    allow_relative: accept "next Friday" style dates (chat messages), checked against
+    the weekday named in the quoted evidence."""
     chunks = chunk_text(text)
     sem = asyncio.Semaphore(MAX_PARALLEL)
 
     async def run(chunk: str) -> list[Item]:
         async with sem:
-            return await _extract_chunk(chunk, context)
+            return await _extract_chunk(chunk, context, allow_relative)
 
     results = await asyncio.gather(*(run(c) for c in chunks), return_exceptions=True)
     items: list[Item] = []
@@ -172,18 +204,23 @@ async def extract(text: str, context: str = "") -> list[Item]:
     return _dedupe_within(items)
 
 
-async def _extract_chunk(chunk: str, context: str) -> list[Item]:
+async def _extract_chunk(chunk: str, context: str, allow_relative: bool = False) -> list[Item]:
     today = datetime.now(TZ).date()
+    relative = ""
+    if allow_relative:
+        days = ", ".join(f"{today + timedelta(days=n):%a %Y-%m-%d}" for n in range(15))
+        relative = RELATIVE_RULES.format(days=days)
     prompt = EXTRACT_PROMPT.format(
         semester=SEMESTER,
         today=f"{today:%A}, {today.isoformat()}",
         context=context or "none",
+        relative=relative,
         text=chunk,
     )
     data = await llm.chat_json([{"role": "user", "content": prompt}], model_name=llm.extract_model())
     out = []
     for raw in data.get("items") or []:
-        out.extend(_validate(raw, chunk))
+        out.extend(_validate(raw, chunk, today if allow_relative else None))
     return out
 
 
@@ -227,7 +264,7 @@ def _date_in(d: date, evidence: str) -> bool:
     return any(n in evidence for n in numeric)
 
 
-def _validate(raw: dict, chunk: str) -> list[Item]:
+def _validate(raw: dict, chunk: str, relative_today: date | None = None) -> list[Item]:
     """Drop anything the text does not actually support."""
     if not isinstance(raw, dict):
         return []
@@ -264,7 +301,9 @@ def _validate(raw: dict, chunk: str) -> list[Item]:
         d = date.fromisoformat(str(raw.get("date")))
     except ValueError:
         return []
-    if not (SEMESTER_START <= d <= SEMESTER_END) or not _date_in(d, evidence):
+    if not (SEMESTER_START <= d <= SEMESTER_END):
+        return []
+    if not _date_in(d, evidence) and not (relative_today and _relative_ok(d, evidence, relative_today)):
         return []
     return [Item(kind=kind, title=title, course=course, due_date=d, due_time=_parse_time(raw.get("time")))]
 
@@ -309,23 +348,53 @@ def similar_titles(a: str, b: str, course: str = "") -> bool:
     sa, sb = set(ta), set(tb)
     if sa == sb:
         return True
+    # "Weekly Economist Assignment #4 (Publication Date: September 26th)" is "... #4".
+    pa = set(_title_tokens(re.sub(r"\([^)]*\)", " ", a), course))
+    pb = set(_title_tokens(re.sub(r"\([^)]*\)", " ", b), course))
+    if pa and pa == pb:
+        return True
     small, big = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
     if small <= big and small & _ANCHOR_WORDS:
         return True
     return SequenceMatcher(None, " ".join(ta), " ".join(tb)).ratio() >= 0.9
 
 
+_COURSE_STOP = {"for", "the", "and", "of", "to", "in", "a", "an", "fall", "spring", "summer", "2026", "2027"}
+
+
+def _course_tokens(course: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", (course or "").lower())
+    return {w[:-1] if len(w) > 3 and w.endswith("s") else w for w in words if w not in _COURSE_STOP}
+
+
 def _courses_match(a: str, b: str) -> bool:
+    """Same course under different names: "OM" matches nothing but itself, while
+    "Financial Analysis for Tech Manager - Foy" matches "Financial Analysis for Tech Managers"."""
     na, nb = _norm_course(a), _norm_course(b)
-    return na == nb or not na or not nb
+    if na == nb or not na or not nb or na in nb or nb in na:
+        return True
+    ta, tb = _course_tokens(a), _course_tokens(b)
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / min(len(ta), len(tb)) >= 0.75
+
+
+def course_of(title: str, known_courses: list[str]) -> str | None:
+    """The known course a calendar event title refers to, e.g. "Operation Management - Jacoby"."""
+    base = re.split(r"\s+-\s+", title)[0]
+    for c in known_courses:
+        if c and _course_tokens(base) and _courses_match(base, c) and len(_course_tokens(base)) >= 2:
+            return c
+    return None
 
 
 def same_item(a: Item, b: Item) -> bool:
-    kinds = {a.kind, b.kind}
-    if kinds == {"class", "event"}:
-        # A calendar event at a syllabus class's weekday and start time is that class.
+    if (a.kind == "class") != (b.kind == "class"):
         c, e = (a, b) if a.kind == "class" else (b, a)
-        return e.due_time is not None and e.due_date.weekday() == c.weekday and e.due_time == c.start_time
+        if e.kind in ("event", "class_session"):
+            # A calendar event at a syllabus class's weekday and start time is that class.
+            return e.due_time is not None and e.due_date.weekday() == c.weekday and e.due_time == c.start_time
+        return False
     if (a.kind == "class") != (b.kind == "class"):
         return False
     if not _courses_match(a.course, b.course):
@@ -366,6 +435,8 @@ def _row_to_item(r: sqlite3.Row) -> Item:
         end_time=_parse_time(r["end_time"]),
         room=r["room"],
         uid=r["uid"],
+        source=r["source"],
+        note=r["note"],
     )
 
 
@@ -410,16 +481,17 @@ def _hhmm(t: time | None) -> str | None:
 def _insert_item(uid: str, batch_id, source: str, it: Item, now: datetime) -> None:
     cur = _db.execute(
         """INSERT INTO items (user_id, batch_id, source, kind, course, title, due_date, due_time,
-                              weekday, start_time, end_time, room, uid, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                              weekday, start_time, end_time, room, uid, note, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             uid, batch_id, source, it.kind, it.course, it.title,
             it.due_date.isoformat() if it.due_date else None,
             _hhmm(it.due_time), it.weekday, _hhmm(it.start_time), _hhmm(it.end_time),
-            it.room, it.uid, datetime.now(timezone.utc).isoformat(),
+            it.room, it.uid, it.note, datetime.now(timezone.utc).isoformat(),
         ),
     )
     it.id = cur.lastrowid
+    it.source = source
     _schedule_reminders(uid, it, now)
 
 
@@ -428,26 +500,65 @@ def _insert_item(uid: str, batch_id, source: str, it: Item, now: datetime) -> No
 
 @dataclass
 class SyncResult:
+    in_feed: int = 0
     added: list[Item] = field(default_factory=list)
+    already: int = 0  # matched an item that was already there (PDF, chat or another feed)
+    adopted: int = 0  # of those, PDF or chat items now kept up to date by this feed
+    corrected: int = 0  # PDF items whose date the feed corrected
     updated: int = 0
     removed: int = 0
-    duplicates: int = 0
+
+
+_FEED_FIELDS = ("kind", "course", "title", "due_date", "due_time", "end_time", "room", "note")
+
+
+def _feed_values(it: Item) -> tuple:
+    return (
+        it.kind, it.course, it.title, it.due_date.isoformat() if it.due_date else None,
+        _hhmm(it.due_time), _hhmm(it.end_time), it.room, it.note,
+    )
+
+
+def _take_over(row_id: int, it: Item, source: str, batch_id, uid: str, now: datetime) -> None:
+    """Point an existing row at the feed item (same id, so /week and reminders follow)."""
+    _db.execute(
+        f"UPDATE items SET {', '.join(f + '=?' for f in _FEED_FIELDS)}, source=?, uid=?, batch_id=COALESCE(?, batch_id) WHERE id=?",
+        (*_feed_values(it), source, it.uid, batch_id, row_id),
+    )
+    _db.execute("DELETE FROM reminders WHERE item_id = ? AND sent = 0", (row_id,))
+    it.id, it.source = row_id, source
+    _schedule_reminders(uid, it, now)
 
 
 def sync_events(user_id, events: list[Item], source: str) -> SyncResult:
-    """Mirror a calendar feed's future events. Matches by UID first; new events that
-    match any existing item (same title and day, e.g. a Brightspace deadline) are skipped.
-    Future events that disappeared from the feed are removed."""
+    """Mirror a calendar feed's future items.
+
+    - Known UID: update the row if anything changed.
+    - Matches a PDF or chat item (course, similar title, same day): the feed takes it over,
+      so there is one row and it stays current. Same course and exact title on another day:
+      the PDF date was wrong, the feed corrects it.
+    - Matches an item from another feed: keep that one, skip this.
+    - Future items that disappeared from the feed are removed.
+    """
     uid = str(user_id)
     now = datetime.now(TZ)
-    result = SyncResult()
-    rows = _db.execute(
-        "SELECT * FROM items WHERE user_id = ? AND source = ? AND uid IS NOT NULL", (uid, source)
-    ).fetchall()
-    by_uid = {r["uid"]: r for r in rows}
+    result = SyncResult(in_feed=len(events))
+    by_uid = {
+        r["uid"]: r for r in _db.execute(
+            "SELECT * FROM items WHERE user_id = ? AND source = ? AND uid IS NOT NULL", (uid, source)
+        ).fetchall()
+    }
     seen: set[str] = set()
-    others = existing_items(uid)
     batch_id = None
+
+    def batch() -> int:
+        nonlocal batch_id
+        if batch_id is None:
+            batch_id = _db.execute(
+                "INSERT INTO batches (user_id, kind, label, created_at) VALUES (?, ?, ?, ?)",
+                (uid, source, f"{source} sync", datetime.now(timezone.utc).isoformat()),
+            ).lastrowid
+        return batch_id
 
     for ev in events:
         if ev.uid in seen:
@@ -455,29 +566,38 @@ def sync_events(user_id, events: list[Item], source: str) -> SyncResult:
         seen.add(ev.uid)
         row = by_uid.get(ev.uid)
         if row is not None:
-            if (row["title"], row["due_date"], row["due_time"], row["end_time"], row["room"]) != (
-                ev.title, ev.due_date.isoformat(), _hhmm(ev.due_time), _hhmm(ev.end_time), ev.room,
-            ):
-                _db.execute(
-                    "UPDATE items SET title=?, due_date=?, due_time=?, end_time=?, room=? WHERE id=?",
-                    (ev.title, ev.due_date.isoformat(), _hhmm(ev.due_time), _hhmm(ev.end_time), ev.room, row["id"]),
-                )
-                _db.execute("DELETE FROM reminders WHERE item_id = ? AND sent = 0", (row["id"],))
-                ev.id = row["id"]
-                _schedule_reminders(uid, ev, now)
+            if tuple(row[f] for f in _FEED_FIELDS) != _feed_values(ev):
+                _take_over(row["id"], ev, source, None, uid, now)
                 result.updated += 1
             continue
-        if any(same_item(ev, o) for o in others):
-            result.duplicates += 1
+
+        others = [o for o in existing_items(uid) if o.source != source]
+        match = next((o for o in others if same_item(ev, o)), None)
+        if match is None and ev.kind in DEADLINE_KINDS:
+            match = next(
+                (o for o in others if o.source in ("file", "chat") and o.kind in DEADLINE_KINDS
+                 and _courses_match(o.course, ev.course)
+                 and _title_tokens(o.title, o.course) == _title_tokens(ev.title, ev.course)),
+                None,
+            )
+            if match is not None:
+                result.corrected += 1
+        if match is not None:
+            result.already += 1
+            if match.source in ("file", "chat"):
+                _take_over(match.id, ev, source, batch(), uid, now)
+                result.adopted += 1
             continue
-        if batch_id is None:
-            batch_id = _db.execute(
-                "INSERT INTO batches (user_id, kind, label, created_at) VALUES (?, ?, ?, ?)",
-                (uid, source, f"{source} sync", datetime.now(timezone.utc).isoformat()),
-            ).lastrowid
-        _insert_item(uid, batch_id, source, ev, now)
-        others.append(ev)
+        _insert_item(uid, batch(), source, ev, now)
         result.added.append(ev)
+
+    # PDF or chat copies of items this feed now owns (left over from earlier syncs).
+    mine = [i for i in existing_items(uid) if i.source == source]
+    for o in existing_items(uid):
+        if o.source in ("file", "chat") and any(same_item(o, m) for m in mine):
+            _db.execute("DELETE FROM reminders WHERE item_id = ?", (o.id,))
+            _db.execute("DELETE FROM items WHERE id = ?", (o.id,))
+            result.already += 1
 
     for u, row in by_uid.items():
         if u not in seen and due_datetime(_row_to_item(row)) >= now:
@@ -513,43 +633,121 @@ def due_datetime(it: Item) -> datetime:
     return datetime.combine(it.due_date, it.due_time or END_OF_DAY, tzinfo=TZ)
 
 
-def _schedule_reminders(uid: str, it: Item, now: datetime) -> None:
-    if it.kind == "class":
-        return
-    due = due_datetime(it)
-    if it.kind == "event":
-        leads = [("hours", timedelta(hours=2))] if it.due_time else []
+DEADLINE_LEADS = [("3d", timedelta(days=3)), ("1d", timedelta(days=1)), ("3h", timedelta(hours=3))]
+EXAM_LEADS = [("1w", timedelta(weeks=1))] + DEADLINE_LEADS
+CLASS_LEAD = ("30m", timedelta(minutes=30))
+EVENT_LEAD = ("1h", timedelta(hours=1))
+STALE_AFTER = timedelta(hours=1)  # a reminder missed by more than this (bot was off) is dropped
+LEAD_WORDS = {
+    "1w": "in 1 week", "3d": "in 3 days", "1d": "tomorrow", "3h": "in 3 hours",
+    "1h": "in 1 hour", "30m": "in 30 minutes",
+}
+
+
+def reminder_plan(it: Item, start: datetime, end: datetime) -> list[tuple[str, datetime]]:
+    """(lead, time) for every reminder of this item that falls in [start, end).
+
+    Assignments: 3 days, 1 day, 3 hours before (exams also 1 week). Classes: 30 minutes
+    before each meeting. Other timed events: 1 hour before. All-day events: none.
+    """
+    if it.kind == "class":  # weekly: one reminder per meeting
+        out, d = [], (start + CLASS_LEAD[1]).date()
+        while d <= min((end + CLASS_LEAD[1]).date(), SEMESTER_END):
+            if d.weekday() == it.weekday and it.start_time:
+                at = datetime.combine(d, it.start_time, tzinfo=TZ) - CLASS_LEAD[1]
+                if start <= at < end:
+                    out.append((CLASS_LEAD[0], at))
+            d += timedelta(days=1)
+        return out
+    if it.kind in ("class_session", "event"):
+        if it.due_time is None:
+            return []
+        leads = [CLASS_LEAD] if it.kind == "class_session" else [EVENT_LEAD]
     else:
-        leads = [("day", timedelta(days=1)), ("hours", timedelta(hours=2))]
-    if it.kind == "exam":
-        leads.insert(0, ("week", timedelta(weeks=1)))
-    for lead, delta in leads:
-        at = due - delta
-        if at > now:
-            _db.execute(
-                "INSERT INTO reminders (item_id, user_id, remind_at, lead) VALUES (?, ?, ?, ?)",
-                (it.id, uid, at.astimezone(timezone.utc).isoformat(), lead),
-            )
+        leads = EXAM_LEADS if it.kind == "exam" else DEADLINE_LEADS
+    due = due_datetime(it)
+    return [(lead, due - delta) for lead, delta in leads if start <= due - delta < end]
 
 
-def pop_due_reminders() -> list[tuple[str, str]]:
-    """Return (user_id, message) for every reminder that is due, marking them sent."""
-    now = datetime.now(timezone.utc).isoformat()
+def _schedule_reminders(uid: str, it: Item, now: datetime) -> None:
+    horizon = now + (timedelta(days=2) if it.kind == "class" else timedelta(days=400))
+    for lead, at in reminder_plan(it, now, horizon):
+        _db.execute(
+            "INSERT OR IGNORE INTO reminders (item_id, user_id, remind_at, lead) VALUES (?, ?, ?, ?)",
+            (it.id, uid, at.astimezone(timezone.utc).isoformat(), lead),
+        )
+
+
+def plan_all_reminders(now: datetime | None = None) -> None:
+    """Re-plan unsent reminders for every item with the current rules. Safe to run on
+    every start and loop: sent reminders are kept, so nothing is ever sent twice.
+    Weekly classes get their next two days of meetings planned."""
+    now = now or datetime.now(TZ)
+    _db.execute("DELETE FROM reminders WHERE sent = 0")
+    for r in _db.execute("SELECT * FROM items").fetchall():
+        _schedule_reminders(r["user_id"], _row_to_item(r), now)
+    _db.commit()
+
+
+def ensure_class_reminders(now: datetime | None = None) -> None:
+    """Plan the next two days of weekly class meetings (their reminders roll forward)."""
+    now = now or datetime.now(TZ)
+    for r in _db.execute("SELECT * FROM items WHERE kind = 'class'").fetchall():
+        _schedule_reminders(r["user_id"], _row_to_item(r), now)
+    _db.commit()
+
+
+def pop_due_reminders(now: datetime | None = None) -> list[tuple[str, Item, str]]:
+    """(user_id, item, lead) for every reminder that is due. Each is marked sent before
+    it is returned, so a crash or restart can never send it twice. Reminders missed
+    while the bot was off for more than an hour are dropped rather than sent late."""
+    now = now or datetime.now(TZ)
     rows = _db.execute(
-        """SELECT r.id AS rid, r.user_id, r.lead, i.* FROM reminders r
+        """SELECT r.id AS rid, r.user_id AS ruser, r.lead, r.remind_at, i.* FROM reminders r
            JOIN items i ON i.id = r.item_id
            WHERE r.sent = 0 AND r.remind_at <= ? ORDER BY r.remind_at""",
-        (now,),
+        (now.astimezone(timezone.utc).isoformat(),),
     ).fetchall()
     out = []
     for r in rows:
         _db.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (r["rid"],))
-        it = _row_to_item(r)
-        when = {"week": "in 1 week", "day": "tomorrow", "hours": "in 2 hours"}[r["lead"]]
-        verb = {"exam": "is", "event": "starts"}.get(it.kind, "is due")
-        out.append((r["user_id"], f"⏰ {label(it)} {verb} {when}: {fmt_due(it)}"))
-    _db.commit()
+        _db.commit()
+        if now - datetime.fromisoformat(r["remind_at"]) > STALE_AFTER:
+            continue
+        out.append((r["ruser"], _row_to_item(r), r["lead"]))
     return out
+
+
+def preview_reminders(user_id, at: datetime, window: timedelta = timedelta(minutes=5)) -> list[tuple[Item, str]]:
+    """Reminders that would fire in (at - window, at], computed from the rules. Nothing is stored."""
+    out = []
+    for it in existing_items(user_id):
+        for lead, when in reminder_plan(it, at - window + timedelta(seconds=1), at + timedelta(seconds=1)):
+            out.append((it, lead))
+    return out
+
+
+def reminder_text(it: Item, lead: str) -> str:
+    when = LEAD_WORDS[lead]
+    lockdown = " 🔒 Needs LockDown Browser." if it.note and "LockDown" in it.note else ""
+    if it.kind in ("class", "class_session"):
+        room = f" at {it.room}" if it.room else ""
+        return f"🎓 {it.title} starts {when}{room}."
+    if it.kind == "event":
+        room = f", {it.room}" if it.room else ""
+        return f"⏰ {it.title} starts {when}: {fmt_time(it.due_time)}{room}"
+    verb = "is" if it.kind == "exam" else "is due"
+    return f"⏰ {label(it)} {verb} {when}: {fmt_due(it)}.{lockdown}"
+
+
+def next_due_for_course(user_id, course: str, after: datetime) -> Item | None:
+    """The next deadline for this course after the given time."""
+    items = [
+        i for i in existing_items(user_id)
+        if i.kind in DEADLINE_KINDS and i.course and course and _courses_match(i.course, course)
+        and due_datetime(i) > after
+    ]
+    return min(items, key=due_datetime, default=None)
 
 
 # ---------- Formatting ----------
@@ -585,9 +783,9 @@ def fmt_class_group(items: list[Item]) -> list[str]:
     return lines
 
 
-def week_view(user_id, days: int = 7) -> str:
-    today = datetime.now(TZ).date()
-    now = datetime.now(TZ)
+def week_view(user_id, days: int = 7, now: datetime | None = None) -> str:
+    now = now or datetime.now(TZ)
+    today = now.date()
     items = existing_items(user_id)
     lines = []
     for n in range(days):
@@ -597,19 +795,21 @@ def week_view(user_id, days: int = 7) -> str:
             if i.kind == "class" and i.weekday == d.weekday():
                 room = f", {i.room}" if i.room else ""
                 entries.append((i.start_time, f"  {fmt_time(i.start_time)} {i.course or i.title} class{room}"))
-            elif i.kind == "event" and i.due_date == d:
+            elif i.kind in ("event", "class_session") and i.due_date == d:
                 if i.due_time and n == 0 and due_datetime(i) < now:
                     continue
                 when = fmt_time(i.due_time) if i.due_time else "All day"
                 room = f", {i.room}" if i.room else ""
-                entries.append((i.due_time or time(0, 0), f"  {when} {i.title}{room}"))
-            elif i.kind not in ("class", "event") and i.due_date == d:
+                icon = "🎓 " if i.kind == "class_session" else ""
+                entries.append((i.due_time or time(0, 0), f"  {when} {icon}{i.title}{room}"))
+            elif i.kind in DEADLINE_KINDS and i.due_date == d:
                 when = fmt_time(i.due_time) if i.due_time else "any time"
-                entries.append((i.due_time or END_OF_DAY, f"  📌 {label(i)}, due {when}"))
+                lock = " 🔒" if i.note and "LockDown" in i.note else ""
+                entries.append((i.due_time or END_OF_DAY, f"  📌 {label(i)}, due {when}{lock}"))
         if not entries:
             continue
         lines.append(("Today, " if n == 0 else "") + fmt_day(d))
         lines += [line for _, line in sorted(entries, key=lambda e: e[0])]
     if not lines:
-        return "Nothing on your calendar for the next 7 days 💜"
-    return "📅 Your next 7 days\n\n" + "\n".join(lines)
+        return f"Nothing on your calendar for the next {days} days 💜"
+    return f"📅 Your next {days} days\n\n" + "\n".join(lines)
