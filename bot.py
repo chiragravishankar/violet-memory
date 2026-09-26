@@ -594,7 +594,7 @@ def _recent_messages(user_id, days: int = 7) -> list[str]:
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     rows = _db.execute(
         "SELECT text, classification FROM messages WHERE user_id = ? AND direction = 'in' AND ts >= ? "
-        "AND text NOT LIKE '/%' ORDER BY id",
+        "AND text NOT LIKE '/%' AND text NOT LIKE '[button]%' ORDER BY id",
         (int(user_id), since),
     ).fetchall()
     return [f"[{c or 'message'}] {t}" for t, c in rows if t]
