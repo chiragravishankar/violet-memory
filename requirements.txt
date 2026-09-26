@@ -1,0 +1,3 @@
+python-telegram-bot>=21,<23
+cognee==1.6.1
+python-dotenv
