@@ -653,11 +653,12 @@ CLASS_LEAD = ("30m", timedelta(minutes=30))
 EVENT_LEAD = ("1h", timedelta(hours=1))
 # Events he said "going" to from discovery (source "nyu_events", later "luma", ...): 1 day and 2 hours.
 RSVP_LEADS = [("1d", timedelta(days=1)), ("2h", timedelta(hours=2))]
+APPROVAL_LEAD = ("approval", timedelta(days=2))  # check the host approved his registration
 CALENDAR_SOURCES = {"file", "chat", "brightspace", "google"}
 STALE_AFTER = timedelta(hours=1)  # a reminder missed by more than this (bot was off) is dropped
 LEAD_WORDS = {
     "1w": "in 1 week", "3d": "in 3 days", "1d": "tomorrow", "3h": "in 3 hours",
-    "1h": "in 1 hour", "30m": "in 30 minutes", "2h": "in 2 hours",
+    "1h": "in 1 hour", "30m": "in 30 minutes", "2h": "in 2 hours", "approval": "in 2 days",
 }
 
 
@@ -683,6 +684,8 @@ def reminder_plan(it: Item, start: datetime, end: datetime) -> list[tuple[str, d
             leads = [CLASS_LEAD]
         elif it.source and it.source not in CALENDAR_SOURCES:
             leads = RSVP_LEADS  # an event he chose to go to
+            if it.note and "[needs approval]" in it.note:
+                leads = [APPROVAL_LEAD] + leads
         else:
             leads = [EVENT_LEAD]
     else:
@@ -768,6 +771,8 @@ def preview_reminders(user_id, at: datetime, window: timedelta = timedelta(minut
 def reminder_text(it: Item, lead: str) -> str:
     when = LEAD_WORDS[lead]
     lockdown = " 🔒 Needs LockDown Browser." if it.note and "LockDown" in it.note else ""
+    if lead == "approval":
+        return f"⏰ {it.title} is {when} ({fmt_due(it)}) and needs host approval. Check whether you got approved."
     if it.kind in ("class", "class_session"):
         room = f" at {it.room}" if it.room else ""
         return f"🎓 {it.title} starts {when}{room}."

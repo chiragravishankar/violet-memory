@@ -309,15 +309,16 @@ Startup Pitch Night at Leslie eLab, Thu 6:30 PM. Good fit for your credits pitch
 Wasserman fintech recruiting session, Fri 4 PM. Fits your Summer 2027 internship search. https://...
 Say 'going' to either and I'll add it to your calendar.
 
-One short lead-in line. Then one short paragraph per event: name and host or place, day and time, the
-why in a few words, "You're free" or the clash, a registration deadline if there is one, then the link
-on the same line. A "last-minute" event starts with "Heads up, this is <day>". A "you asked me to
+One short lead-in line. Then one short paragraph per event, in the order given (best first): name and host or place, day and time, the
+why in a few words, "You're free" or the clash, a registration deadline if there is one, the price
+if it's paid, "needs approval, apply early" or "waitlist only" when flagged, then the link on the
+same line. Never write the words "last-minute" or "label". A "last-minute" event starts with "Heads up, this is <day>". A "you asked me to
 remind you" event says so briefly. End with one line on replying 'going', 'not for me', 'more like
 this' or 'remind me later' (short, natural)."""
 
 EVENTS_ANSWER_TASK = """He asked: "{question}"
 
-Relevant NYU events from {start} to {end}, best matches first (facts; keep links exactly):
+Relevant events (NYU Events and Luma) from {start} to {end}, best matches first (facts; keep links exactly):
 {facts}
 
 Answer from these only. Pick what fits the question (for example, career events, or what's at a
@@ -353,7 +354,8 @@ async def answer_events(user_id, question: str, now: datetime | None = None, rec
     import events
 
     now = now or datetime.now(TZ)
-    start_d, end_d, _ = schedule.parse_range(question, now.date()) or (now.date(), now.date() + timedelta(days=6), "")
+    # No period named ("any AI hackathons coming up?"): look two weeks out, about what Luma covers.
+    start_d, end_d, _ = schedule.parse_range(question, now.date()) or (now.date(), now.date() + timedelta(days=13), "")
     start = max(now, datetime.combine(start_d, datetime.min.time(), tzinfo=TZ))
     end = datetime.combine(end_d, datetime.max.time(), tzinfo=TZ)
     found = events.matches(user_id, start, end, min_score=30)[:25]

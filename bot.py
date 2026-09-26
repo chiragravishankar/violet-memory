@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,7 +30,7 @@ log = logging.getLogger("bot")
 # Reference list shown word for word under /help (not a reply; the reply is voiced).
 COMMANDS = (
     "/week  your next 7 days\n"
-    "/events  best NYU events this week (/events all, /events refresh)\n"
+    "/events  best events this week, NYU and Luma (/events all, /events refresh, /events add_luma <url>)\n"
     "/undo  remove what your last file added\n"
     "/me  what I know about you (/me setup, /me edit, /me reflect)\n"
     "/forget <text>  make me forget something\n"
@@ -106,7 +107,15 @@ async def speak(update: Update, draft: str, kind: str = "info", user_message: st
     await reply(update, text)
 
 
+_FEED_URL = re.compile(r"https?://\S*(?:ics|ical)\S*", re.I)
+
+
 def inbound_text(update: Update) -> str:
+    """What gets logged for an inbound message. Calendar feed URLs are secrets: redacted."""
+    return _FEED_URL.sub("<feed url>", _inbound_text(update))
+
+
+def _inbound_text(update: Update) -> str:
     msg = update.effective_message
     if msg.document or msg.photo:
         name = msg.document.file_name if msg.document else "photo"
@@ -170,7 +179,7 @@ _buffers: dict[int, dict] = {}
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.effective_message.text
     user_id = update.effective_user.id
-    row = log_message("in", update, text)
+    row = log_message("in", update, _FEED_URL.sub("<feed url>", text))
     await update.effective_chat.send_action(ChatAction.TYPING)
     buf = _buffers.setdefault(user_id, {"parts": [], "rows": []})
     buf["parts"].append(text)
@@ -295,6 +304,31 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     sub = context.args[0].lower() if context.args else ""
     said = inbound_text(update)
     now = datetime.now(schedule.TZ)
+    if sub == "add_luma":
+        url = (context.args[1] if len(context.args) > 1 else "").strip()
+        if not re.match(r"^https://(api\.)?(luma\.com|lu\.ma)/\S+$", url) or "ics" not in url:
+            await speak(update, "Needs a Luma iCal feed link, like /events add_luma https://api.luma.com/ics/get?entity=...",
+                        kind="error", user_message=said)
+            return
+        import luma
+        if url in luma.urls():
+            await speak(update, "That Luma feed is already added.", kind="confirmation", user_message=said)
+            return
+        try:
+            async with events.eventsources.client() as c:
+                resp = await c.get(url)
+                resp.raise_for_status()
+                n = len(luma.parse(resp.content, now))
+        except Exception as e:
+            await speak(update, f"Couldn't read that Luma feed ({type(e).__name__}). Ask him to check the link.",
+                        kind="error", user_message=said)
+            return
+        _add_env_list("LUMA_ICS_URLS", url)
+        report = await _with_typing(update, context, events.refresh(now))
+        scored = await _with_typing(update, context, events.score_new(user_id, now))
+        await speak(update, f"Added the Luma feed ({n} upcoming events in it). Refreshed everything and scored "
+                            f"{scored} new events for him.", kind="confirmation", user_message=said)
+        return
     if sub == "refresh":
         report = await _with_typing(update, context, events.refresh(now))
         scored = await _with_typing(update, context, events.score_new(user_id, now))
@@ -306,7 +340,7 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     top = events.matches(user_id, now, now + timedelta(days=7))
     if sub == "all":
         if not top:
-            await speak(update, "No relevant NYU events in the next 7 days.", kind="answer", user_message=said)
+            await speak(update, "No relevant events in the next 7 days.", kind="answer", user_message=said)
             return
         by_day: dict = {}
         for s in sorted(top, key=lambda s: s.event.start):
@@ -318,17 +352,28 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 t = "all day" if s.event.all_day else schedule.fmt_time(s.event.start.time())
                 lines.append(f"  {t} {s.event.title}, {events.where(s.event)}\n  {s.event.url}")
         events.remember_list(user_id, [s.event.id for s in top])
-        await speak(update, f"All {len(top)} relevant NYU events in the next 7 days are below, by day. Short lead-in.",
+        await speak(update, f"All {len(top)} relevant events (NYU Events and Luma) in the next 7 days are below, by day. Short lead-in.",
                     kind="answer", user_message=said, attach="\n".join(lines))
         return
     top = top[:5]
     if not top:
-        await speak(update, "No strong NYU event matches in the next 7 days.", kind="answer", user_message=said)
+        await speak(update, "No strong event matches in the next 7 days.", kind="answer", user_message=said)
         return
     events.remember_list(user_id, [s.event.id for s in top])
-    await speak(update, "His top NYU event matches for the next 7 days are below, best first. Short lead-in; "
+    await speak(update, "His top event matches (NYU Events and Luma) for the next 7 days are below, best first. Short lead-in; "
                         "mention he can reply 'going', 'not for me', 'more like this' or 'remind me later'.",
                 kind="answer", user_message=said, attach="\n\n".join(events.list_line(s) for s in top))
+
+
+def _add_env_list(key: str, value: str) -> None:
+    """Append a value to a comma-separated .env setting (and the running process). Never logged."""
+    env = Path(__file__).resolve().parent / ".env"
+    lines = env.read_text().splitlines() if env.exists() else []
+    current = next((l.split("=", 1)[1] for l in lines if l.startswith(f"{key}=")), "")
+    merged = ",".join([v for v in current.split(",") if v.strip()] + [value])
+    lines = [l for l in lines if not l.startswith(f"{key}=")] + [f"{key}={merged}"]
+    env.write_text("\n".join(lines) + "\n")
+    os.environ[key] = merged
 
 
 async def _remember(user_id, text: str) -> None:

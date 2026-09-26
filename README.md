@@ -114,15 +114,25 @@ previews what would fire at that moment.
   (2 pages of 1000), tag `ihub`, and the groups Engineering (Tandon), Stern, Wasserman-Center,
   wasserman-center-feed-only, Entrepreneurial-Institute (runs the Leslie eLab) and
   Berkley-Center-for-Entrepreneurship. Every 6 hours, or `/events refresh`.
+- `luma.py`: Luma iCal feeds from `LUMA_ICS_URLS` (comma-separated; add more with
+  `/events add_luma <url>`). Link from "Get up-to-date information at:", address from the
+  "Address:" block (or "address after registering" plus the borough from GEO), host from
+  "Hosted by" / ORGANIZER CN, flags needs_approval / waitlist / paid (with price) / hackathon.
+  A keyword prefilter drops obvious mismatches (yoga, crafts, parties...) before scoring unless
+  they mention AI, startups, VC and similar.
 - `events.py`: events table (separate from the schedule, deduped by id), scoring 0 to 100
   against the profile in batches with the fast model (cached per event), calendar conflicts,
   suggestion windows, and replies.
-- Suggestions: 9 to 11 AM New York, one message, up to 3 events scoring 70+, never clashing
-  with a class, inside the source's lead window (pulled earlier to land a day before a stated
+- Suggestions: 9 to 11 AM New York, one message, up to 3 events scoring 70+ across all sources
+  (best first; the same event on NYU Events and Luma counts once), never clashing with a class
+  or exam, paid events over $50 only at 90+, inside the source's lead window (NYU 3 to 4 days,
+  Luma 6 to 8, approval or waitlist events up to 10) (pulled earlier to land a day before a stated
   registration deadline). Events found after their window opened are suggested once only if
-  they score 90+ ("Heads up, this is Thursday"). Never the same event twice. Quiet hours respected.
+  they score 90+ ("Heads up, this is Thursday"), at most one a day after on-time picks.
+  Score boosts never lift an event past 89: only the model can call a must-see. Never the same event twice. Quiet hours respected.
 - `/events` top 5 for the next 7 days, `/events all` by day, `/events refresh`. Reply "going"
-  (adds it to the calendar, reminders 1 day and 2 hours before, saves to memory), "not for me",
+  (adds it to the calendar, reminders 1 day and 2 hours before, plus a check-your-approval
+  reminder 2 days before for approval-only events, saves to memory), "not for me",
   "more like this" or "remind me later" (back the day before). Questions like "any career events
   this week?" are answered from the events table.
 

@@ -28,7 +28,8 @@ def extract_model() -> str:
 def client() -> AsyncOpenAI:
     global _client
     if _client is None:
-        _client = AsyncOpenAI(api_key=os.getenv("LLM_API_KEY"))
+        # The SDK's default timeout is 10 minutes: one stuck request would freeze a reply that long.
+        _client = AsyncOpenAI(api_key=os.getenv("LLM_API_KEY"), timeout=60, max_retries=2)
     return _client
 
 

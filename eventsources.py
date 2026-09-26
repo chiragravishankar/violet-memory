@@ -21,6 +21,12 @@ LEAD_DAYS = {
     "luma": (8, 6),
 }
 DEFAULT_LEAD_DAYS = (4, 3)
+# Events that need approval or have a waitlist can be suggested this many days out at the earliest.
+EARLY_FLAGS = {"needs_approval", "waitlist"}
+EARLY_LEAD_DAYS = 10
+# Sources whose events go through a cheap keyword prefilter before LLM scoring (broad city feeds).
+PREFILTER_SOURCES = {"luma"}
+MAX_PRICE = 50  # paid events above this are only suggested with a score of 90+
 
 HORIZON_DAYS = 30  # fetch events this far ahead
 FETCH_EVERY = timedelta(hours=6)
@@ -28,8 +34,11 @@ USER_AGENT = "VioletMemory/1.0 (personal student assistant; httpx)"
 TIMEOUT = httpx.Timeout(45.0, connect=15.0)
 
 
-def lead_days(source: str) -> tuple[int, int]:
-    return LEAD_DAYS.get(source, DEFAULT_LEAD_DAYS)
+def lead_days(source: str, flags: list[str] | None = None) -> tuple[int, int]:
+    far, near = LEAD_DAYS.get(source, DEFAULT_LEAD_DAYS)
+    if flags and EARLY_FLAGS & set(flags):
+        far = max(far, EARLY_LEAD_DAYS)
+    return far, near
 
 
 @dataclass
@@ -48,6 +57,8 @@ class Event:
     url: str | None = None
     registration_deadline: str | None = None  # YYYY-MM-DD when the source states one
     canceled: bool = False
+    flags: list[str] = field(default_factory=list)  # needs_approval, waitlist, paid, hackathon
+    price: str | None = None  # e.g. "$25" for paid events
 
 
 class EventSource:
@@ -76,6 +87,7 @@ def local(dt: datetime) -> datetime:
 
 def sources() -> list[EventSource]:
     """Every enabled source. Import here so a broken optional source can't break the rest."""
+    import luma
     import nyu_events
 
-    return [nyu_events.SOURCE]
+    return [nyu_events.SOURCE, luma.SOURCE]

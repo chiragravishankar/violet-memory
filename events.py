@@ -92,6 +92,11 @@ _db.executescript(
     );
     """
 )
+_ev_cols = {r["name"] for r in _db.execute("PRAGMA table_info(events)")}
+if "flags" not in _ev_cols:
+    _db.execute("ALTER TABLE events ADD COLUMN flags TEXT")  # JSON: needs_approval, waitlist, paid, hackathon
+if "price" not in _ev_cols:
+    _db.execute("ALTER TABLE events ADD COLUMN price TEXT")
 _db.commit()
 
 
@@ -109,6 +114,7 @@ def _row_event(r) -> Event:
         all_day=bool(r["all_day"]), location=r["location"], online=bool(r["online"]), organizer=r["organizer"],
         tags=json.loads(r["tags"] or "[]"), description=r["description"] or "", url=r["url"],
         registration_deadline=r["reg_deadline"], canceled=bool(r["canceled"]),
+        flags=json.loads(r["flags"] or "[]"), price=r["price"],
     )
 
 
@@ -129,18 +135,18 @@ def upsert(evs: list[Event], now: datetime) -> list[str]:
     for e in evs:
         vals = (e.source, e.title, e.start.isoformat(), e.end.isoformat() if e.end else None, int(e.all_day),
                 e.location, int(e.online), e.organizer, json.dumps(e.tags), e.description, e.url,
-                e.registration_deadline, int(e.canceled))
+                e.registration_deadline, int(e.canceled), json.dumps(e.flags), e.price)
         cur = _db.execute(
             """UPDATE events SET source=?, title=?, start=?, end=?, all_day=?, location=?, online=?, organizer=?,
-               tags=?, description=?, url=?, reg_deadline=COALESCE(?, reg_deadline), canceled=?, last_seen=?
-               WHERE id=?""",
+               tags=?, description=?, url=?, reg_deadline=COALESCE(?, reg_deadline), canceled=?, flags=?, price=?,
+               last_seen=? WHERE id=?""",
             (*vals, seen_at, e.id),
         )
         if cur.rowcount == 0:
             _db.execute(
                 """INSERT INTO events (source, title, start, end, all_day, location, online, organizer, tags,
-                   description, url, reg_deadline, canceled, first_seen, last_seen, id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   description, url, reg_deadline, canceled, flags, price, first_seen, last_seen, id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (*vals, seen_at, seen_at, e.id),
             )
             new.append(e.id)
@@ -200,9 +206,11 @@ Calibration:
 - A title starting with "DEADLINE:" is a sign-up deadline for a program; judge the program.
 - Boost in-person events in Brooklyn or Manhattan, Tandon, Stern, Wasserman, I-Hub, Leslie eLab.
 
-reason: one short line to him, always "you"/"your" (never his name or "his"), that names the specific
-project, goal or course it fits ("A personal-agent hackathon, basically Violet Memory's home turf").
-Vary the wording; don't start reasons with "Right up". No specific reason: score
+reason: one short line to him, always "you"/"your" (never his name or "his"). It must say what THIS
+event actually is (a dinner, a panel, a workshop, a hackathon...) and which specific thing of his it
+fits: a named project (Violet Memory, ScraperKast), a goal (VC, fintech or AI internships, founders),
+a course, or the Leslie eLab credits proposal. Write each reason fresh for its event; never reuse
+wording from another event. Don't start with "Right up". No specific reason: score
 30 or less and say it's generic. Never invent facts about him.
 deadline: the registration, RSVP or application deadline as YYYY-MM-DD only if the text states a
 date for it, else null. Today is {today}.
@@ -214,18 +222,45 @@ Events:
 
 _BOOST = re.compile(r"entrepreneurial institute|leslie|wasserman|tandon|engineering|stern|berkley|\bi-?hub\b", re.I)
 _OTHER_CAMPUS = re.compile(r"shanghai|abu dhabi", re.I)
+_BUILDER = re.compile(r"\b(agent builders?|ai builders?|builders night|hackathon|founders?|vcs?|venture|investors?|demo night|demo day|pitch night)\b", re.I)
 _UNDERGRAD_ONLY = re.compile(r"undergrad(uate)?s? only|for undergraduate students only|first-year students only", re.I)
+
+
+_OFF_TOPIC = re.compile(
+    r"\b(fitness|workout|run club|running club|yoga|pilates|meditation|breathwork|sound bath|dating|singles|"
+    r"speed dating|crafts?|knitting|pottery|ceramics|candle|painting class|paint and sip|fashion|runway|"
+    r"art opening|gallery opening|exhibition opening|wine tasting|whisky|whiskey|cocktail|brunch|happy hour|"
+    r"dance party|rooftop party|day party|club night|dj set|comedy show|festival|fest)\b", re.I)
+_ON_TOPIC = re.compile(
+    r"\b(ai|a\.i\.|artificial intelligence|llms?|agents?|agentic|machine learning|startups?|founders?|"
+    r"vc|venture|investors?|fintech|web3|crypto|blockchain|healthtech|health tech|biotech|zk|product|"
+    r"growth|marketing|nyu|hackathon|demo night|demo day|pitch|builders?|developers?|engineers?)\b", re.I)
+
+
+def prefilter(e: Event) -> str | None:
+    """Why a broad-feed event is an obvious mismatch (skip the model), or None to score it."""
+    blob = f"{e.title} {e.organizer or ''} {e.description}"
+    m = _OFF_TOPIC.search(blob)
+    if m and not _ON_TOPIC.search(blob):
+        return m.group(0).lower()
+    return None
 
 
 def _event_line(e: Event) -> str:
     when = f"{e.start:%a %b %d}" + ("" if e.all_day else f" {schedule.fmt_time(e.start.time())}")
     where = "online" if e.online else (e.location or "?")
     return (f"id={e.id} | {e.title} | {when} | {where} | by {e.organizer or '?'} | "
-            f"tags: {', '.join(e.tags[:10])} | {e.description[:300]}")
+            f"tags: {', '.join(e.tags[:10])}" + (f" | {e.price}" if e.price else "") + f" | {e.description[:300]}")
+
+
+BOOST_CEILING = 89  # nudges can't lift an event into the 90+ tier; only the model can call a must-see
+MAX_LATE_PER_DAY = 1
 
 
 def _adjust(e: Event, score: int) -> int:
-    """Deterministic nudges on top of the model's score (only for events it found some fit in)."""
+    """Deterministic nudges on top of the model's score (only for events it found some fit in).
+    Penalties apply fully; boosts never push past BOOST_CEILING."""
+    model_score = score
     blob = " ".join([e.title, e.organizer or "", e.location or "", " ".join(e.tags)])
     types = {t.lower() for t in e.tags}
     if _OTHER_CAMPUS.search(blob):
@@ -236,14 +271,38 @@ def _adjust(e: Event, score: int) -> int:
         score -= 25
     if score >= 40 and (_BOOST.search(blob) or "ihub" in types):
         score += 8
-    if score >= 40 and not e.online and e.location and not _OTHER_CAMPUS.search(blob):
-        score += 2
+    if score >= 40 and (_BUILDER.search(f"{e.title} {e.description}") or "hackathon" in e.flags):
+        score += 6
+    if score >= 40 and e.organizer and re.search(r"\bNYU\b|New York University", e.organizer):
+        score += 5
+    if score >= 40 and not e.online and e.location and re.search(r"brooklyn|manhattan|new york, ny", e.location, re.I):
+        score += 3
+    if score > model_score:
+        score = max(model_score, min(score, BOOST_CEILING))
     return max(0, min(100, score))
 
 
 def _prefs(user_id, kind: str) -> list[str]:
     return [r[0] for r in _db.execute(
         "SELECT text FROM event_prefs WHERE user_id = ? AND kind = ? ORDER BY created_at DESC LIMIT 12", (str(user_id), kind))]
+
+
+_KINDS_IN_REASON = {
+    "hackathon": r"hack", "dinner": r"dinner|supper|meal", "panel": r"panel", "workshop": r"workshop|class|training",
+    "fair": r"fair|expo", "conference": r"conference|summit|forum|\.local",
+}
+
+
+def _reason_fits(reason: str, e: Event) -> bool:
+    """Catch reasons written for a different event: calling a dinner a hackathon, say."""
+    text = f"{e.title} {e.description}".lower()
+    r = reason.lower()
+    if "home turf" in r and "hack" not in text:
+        return False
+    for word, pattern in _KINDS_IN_REASON.items():
+        if re.search(rf"\b{word}s?\b", r) and not re.search(pattern, text):
+            return False
+    return True
 
 
 async def _score_batch(user_id, batch: list[Event], profile: str, likes: str, dislikes: str) -> int:
@@ -270,9 +329,12 @@ async def _score_batch(user_id, batch: list[Event], profile: str, likes: str, di
                 deadline = d.isoformat() if schedule._date_in(d, (e.description + " " + e.title).lower()) and d <= e.start.date() else None
             except ValueError:
                 deadline = None
+        reason = voice.polish(str(s.get("reason") or ""), 0)
+        if not _reason_fits(reason, e):
+            reason, score = "Loosely related to your interests.", min(score, 60)
         _db.execute(
             "INSERT OR REPLACE INTO event_scores (user_id, event_id, score, reason, reg_deadline, scored_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (str(user_id), e.id, score, voice.polish(str(s.get("reason") or ""), 0), deadline or None, _utcnow()),
+            (str(user_id), e.id, score, reason, deadline or None, _utcnow()),
         )
         n += 1
     _db.commit()
@@ -284,6 +346,25 @@ async def score_new(user_id, now: datetime | None = None) -> int:
     now = now or datetime.now(TZ)
     evs = [e for e in upcoming(now, now + timedelta(days=eventsources.HORIZON_DAYS))
            if not _db.execute("SELECT 1 FROM event_scores WHERE user_id = ? AND event_id = ?", (str(user_id), e.id)).fetchone()]
+    kept = []
+    dropped: dict[str, int] = {}
+    for e in evs:
+        why = prefilter(e) if e.source in eventsources.PREFILTER_SOURCES else None
+        if why:
+            # Cache the verdict so it's never sent to the model.
+            _db.execute(
+                "INSERT OR REPLACE INTO event_scores (user_id, event_id, score, reason, reg_deadline, scored_at) VALUES (?, ?, 0, ?, NULL, ?)",
+                (str(user_id), e.id, f"filtered out ({why}, no tech or startup angle)", _utcnow()),
+            )
+            dropped[e.source] = dropped.get(e.source, 0) + 1
+        else:
+            kept.append(e)
+    _db.commit()
+    for src in eventsources.PREFILTER_SOURCES:
+        n_src = sum(1 for e in evs if e.source == src)
+        if n_src:
+            log.info("%s prefilter: %d kept, %d dropped", src, n_src - dropped.get(src, 0), dropped.get(src, 0))
+    evs = kept
     if not evs:
         return 0
     data = selfmodel.get_profile(user_id)
@@ -320,7 +401,7 @@ class Scored:
     reason: str
     deadline: date | None
     conflicts: list[str]  # human descriptions, e.g. "your 1:00 PM meeting with Keith Mauppa"
-    class_conflict: bool
+    class_conflict: bool  # clashes with a class or an exam: never suggested
     on_calendar: bool = False  # the same event is already on his calendar
     status: str | None = None
     label: str | None = None  # "last-minute", "you asked me to remind you"
@@ -359,7 +440,7 @@ def _blocks(user_id, day: date) -> list[tuple[datetime, datetime, str, bool, str
             out.append((s, e, what, is_class, it.title))
         elif it.due_date == day and it.due_time and it.kind == "exam":
             due = datetime.combine(day, it.due_time, tzinfo=TZ)
-            out.append((due - timedelta(minutes=90), due, f"{it.title} (exam)", False, it.title))
+            out.append((due - timedelta(minutes=90), due, f"{it.title} (exam)", True, it.title))  # blocks, like a class
     return out
 
 
@@ -385,7 +466,7 @@ def conflicts(user_id, e: Event) -> tuple[list[str], bool, bool]:
 def window(e: Event, deadline: date | None) -> tuple[date, date]:
     """Days on which this event may be suggested: its source's lead time, pulled earlier so it
     lands at least 1 day before a registration deadline."""
-    far, near = lead_days(e.source)
+    far, near = lead_days(e.source, e.flags)
     start, end = e.start.date() - timedelta(days=far), e.start.date() - timedelta(days=near)
     if deadline:
         by = deadline - timedelta(days=1)
@@ -404,14 +485,19 @@ def _already(user_id, event_id: str, demo: bool) -> bool:
 
 
 def _dedupe(items: list[Scored]) -> list[Scored]:
-    """Some events are posted twice under different ids: same title, same start. Keep one."""
-    seen, out = set(), []
+    """One entry per real event: the same event can be posted twice on NYU Events, or on both NYU
+    Events and Luma. Same start day and a similar title count as one (the first, best-scored, wins)."""
+    out: list[Scored] = []
     for s in items:
-        key = (re.sub(r"[^a-z0-9]", "", s.event.title.lower()), s.event.start.isoformat())
-        if key not in seen:
-            seen.add(key)
+        if not any(o.event.start.date() == s.event.start.date() and schedule.similar_titles(o.event.title, s.event.title)
+                   for o in out):
             out.append(s)
     return out
+
+
+def _price(e: Event) -> float:
+    m = re.search(r"\d+(?:\.\d+)?", e.price or "")
+    return float(m.group(0)) if m else 0.0
 
 
 def picks_for_day(user_id, day: date, demo: bool = False) -> list[Scored]:
@@ -434,6 +520,8 @@ def picks_for_day(user_id, day: date, demo: bool = False) -> list[Scored]:
             continue
         if s.score < SUGGEST_MIN or _already(user_id, e.id, demo):
             continue
+        if _price(e) > eventsources.MAX_PRICE and s.score < LATE_MIN:
+            continue
         w_start, w_end = window(e, s.deadline)
         seen = first_seen(e.id)
         found_before_window = seen <= datetime.combine(w_start, DELIVERY_TIME, tzinfo=TZ)
@@ -442,8 +530,16 @@ def picks_for_day(user_id, day: date, demo: bool = False) -> list[Scored]:
         elif not found_before_window and seen.date() <= day and s.score >= LATE_MIN:
             s.label = "last-minute"
             out.append(s)
-    out.sort(key=lambda s: (s.label != "you asked me to remind you", -s.score, s.event.start))
-    return _dedupe(out)[:PICKS_PER_DAY]
+    # Asked-for reminders first, then on-time picks, then at most one late find to fill a slot.
+    out.sort(key=lambda s: (s.label != "you asked me to remind you", s.label == "last-minute", -s.score, s.event.start))
+    picked, late = [], 0
+    for s in _dedupe(out):
+        if s.label == "last-minute":
+            if late >= MAX_LATE_PER_DAY:
+                continue
+            late += 1
+        picked.append(s)
+    return picked[:PICKS_PER_DAY]
 
 
 def record_picks(user_id, day: date, picks: list[Scored], message: str | None, demo: bool = False) -> None:
@@ -476,6 +572,8 @@ def matches(user_id, start: datetime, end: datetime, min_score: int = LIST_MIN) 
     class clashes are left out."""
     out = []
     for e in upcoming(start, end):
+        if e.start < start and not e.all_day:
+            continue  # already started
         s = scored(user_id, e)
         if s and s.score >= min_score and s.status != "hidden" and not s.class_conflict and not s.on_calendar:
             out.append(s)
@@ -499,6 +597,7 @@ def fact_line(s: Scored) -> str:
     parts = [f"{e.title} ({e.organizer})" if e.organizer else e.title, when(e), where(e), f"why: {s.reason}"]
     if s.deadline:
         parts.append(f"register by {schedule.fmt_day(s.deadline)}")
+    parts += flag_notes(e)
     parts.append(f"clashes with {', '.join(s.conflicts)}" if s.conflicts else "he's free then")
     if s.label:
         parts.append(s.label)
@@ -511,7 +610,20 @@ def list_line(s: Scored) -> str:
     e = s.event
     extra = f" (clashes with {', '.join(s.conflicts)})" if s.conflicts else ""
     dl = f" Register by {schedule.fmt_day(s.deadline)}." if s.deadline else ""
-    return f"{when(e)}: {e.title}, {where(e)}{extra}\n{s.reason}{dl}\n{e.url}"
+    notes = "; ".join(flag_notes(e))
+    notes = f" ({notes[:1].upper() + notes[1:]}.)" if notes else ""
+    return f"{when(e)}: {e.title}, {where(e)}{extra}\n{s.reason}{dl}{notes}\n{e.url}"
+
+
+def flag_notes(e: Event) -> list[str]:
+    out = []
+    if "needs_approval" in e.flags:
+        out.append("needs approval, apply early")
+    if "waitlist" in e.flags:
+        out.append("waitlist only")
+    if e.price:
+        out.append(f"{e.price} ticket" if e.price.startswith("$") else f"paid: {e.price}")
+    return out
 
 
 def remember_list(user_id, ids: list[str]) -> None:
@@ -592,10 +704,13 @@ async def act(user_id, action: str, e: Event) -> str:
             kind="event", title=e.title, due_date=e.start.date(),
             due_time=None if e.all_day else e.start.time().replace(second=0, microsecond=0),
             end_time=e.end.time().replace(second=0, microsecond=0) if e.end and not e.all_day and e.end.date() == e.start.date() else None,
-            room=where(e), uid=e.id, note=e.url,
+            room=where(e), uid=e.id,
+            note=(e.url or "") + (" [needs approval]" if "needs_approval" in e.flags else ""),
         ), source=e.source)
         await brain.save(user_id, f"I'm going to {e.title} ({e.organizer or 'NYU'}) on {when(e)} at {where(e)}. {e.url}")
         tail = "Reminders 1 day and 2 hours before." if not e.all_day else ""
+        if "needs_approval" in e.flags:
+            tail += " It needs host approval, so apply now; you'll remind him to check his approval 2 days before."
         return (f"Added to his calendar: {e.title}, {when(e)}, {where(e)}. {tail} Link to register if needed: {e.url}"
                 if added else f"{e.title} is already on his calendar.")
     if action == "hide":
