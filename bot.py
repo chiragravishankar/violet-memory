@@ -914,12 +914,12 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
-def main() -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise SystemExit("TELEGRAM_BOT_TOKEN is missing. Put it in .env")
-
-    app = Application.builder().token(token).concurrent_updates(True).post_init(post_init).build()
+def build_app(token: str) -> Application:
+    app = (
+        Application.builder().token(token).concurrent_updates(True).post_init(post_init)
+        .connect_timeout(20).read_timeout(30).get_updates_connect_timeout(20).get_updates_read_timeout(40)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("week", week_cmd))
@@ -936,9 +936,28 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, on_voice))
     app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, on_other))
     app.add_error_handler(on_error)
+    return app
 
-    log.info("Violet Memory is running. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+def main() -> None:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise SystemExit("TELEGRAM_BOT_TOKEN is missing. Put it in .env")
+    from telegram.error import NetworkError
+
+    # A brief network drop while starting (reaching Telegram) used to kill the bot. Retry instead.
+    for attempt in range(1, 7):
+        try:
+            log.info("Violet Memory is running. Press Ctrl+C to stop.")
+            build_app(token).run_polling(allowed_updates=Update.ALL_TYPES)
+            return
+        except NetworkError as e:  # includes TimedOut
+            wait = min(60, 5 * attempt)
+            log.warning("could not reach Telegram at startup (%s), retrying in %ds", type(e).__name__, wait)
+            import time as _time
+            _time.sleep(wait)
+            asyncio.set_event_loop(asyncio.new_event_loop())
+    raise SystemExit("Could not reach Telegram after several tries.")
 
 
 if __name__ == "__main__":
