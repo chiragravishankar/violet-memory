@@ -5,6 +5,9 @@ with `?` and it answers from your memories. Each user's memory is private.
 
 - `bot.py`: Telegram channel (long polling, no webhooks). Swap this file to change channels.
 - `brain.py`: memory logic (Cognee). No Telegram code.
+- `docs.py`: text from PDF, Word, .txt/.md and images (OpenAI vision for photos and scanned PDFs).
+- `schedule.py`: deadline and class extraction, dedupe, reminders, week view (SQLite `data/violet.db`).
+- `ingest.py`: file and chat pipelines that tie the above together.
 - `data/`: created on first run. Holds Cognee's databases and `messages.db`
   (SQLite log of every inbound and outbound message).
 
@@ -48,6 +51,18 @@ Open your bot in Telegram and send `/start`.
 - Text ending in `?`: `cognee.search` with `SearchType.GRAPH_COMPLETION` scoped
   to that user's dataset only. If cognify is still running, it answers with
   what's available and says new memories may take a few seconds to connect.
+
+## Documents and reminders
+
+Send a PDF, .docx, .txt, .md or photo (max 20 MB), ideally with a caption like
+"OM syllabus". It is saved to `data/files/<user_id>/`, added to memory, and any
+dated deadlines or weekly class times are added to your calendar (Fall 2026,
+America/New_York). Deadlines remind you 1 day and 2 hours before; exams also
+1 week before. `/week` shows the next 7 days, `/undo` removes items from your
+last file.
+
+Only one process can use the Cognee database at a time, so stop the bot before
+running scripts that import `brain.py`.
 
 ## Inspect the message log
 

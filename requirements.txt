@@ -1,3 +1,10 @@
 python-telegram-bot>=21,<23
 cognee==1.6.1
 python-dotenv
+openai
+pypdf
+pypdfium2
+python-docx
+Pillow
+icalendar
+recurring-ical-events

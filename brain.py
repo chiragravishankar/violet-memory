@@ -60,6 +60,14 @@ async def remember(user_id: int | str, text: str) -> None:
     await connect(user_id)
 
 
+def document_memory(file_name: str, caption: str | None, text: str) -> str:
+    """Text stored in memory for a file, with a header so questions can name the file."""
+    header = [f"Document: {file_name}"]
+    if caption:
+        header.append(f"Caption: {caption}")
+    return "\n".join(header) + "\n\n" + text
+
+
 async def recall(user_id: int | str, question: str) -> str:
     """Answer a question using only this user's memories."""
     ds = dataset_for(user_id)
