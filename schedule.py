@@ -76,6 +76,10 @@ if "uid" not in _cols:
     _db.execute("ALTER TABLE items ADD COLUMN uid TEXT")  # calendar feed UID
 if "note" not in _cols:
     _db.execute("ALTER TABLE items ADD COLUMN note TEXT")
+if "display_title" not in _cols:
+    _db.execute("ALTER TABLE items ADD COLUMN display_title TEXT")  # cleaned once, cached
+if "done" not in _cols:
+    _db.execute("ALTER TABLE items ADD COLUMN done INTEGER NOT NULL DEFAULT 0")
 # One row per item, lead and time: re-planning after a restart can never duplicate a reminder.
 _db.execute("CREATE UNIQUE INDEX IF NOT EXISTS reminders_once ON reminders (item_id, lead, remind_at)")
 _db.commit()
@@ -137,6 +141,12 @@ class Item:
     series_uid: str | None = None  # recurring series UID (not stored)
     source: str | None = None  # file, chat, brightspace, google
     note: str | None = None  # e.g. "Needs LockDown Browser"
+    display_title: str | None = None  # cleaned-up title for views (the original stays in title)
+    done: bool = False
+
+    @property
+    def shown(self) -> str:
+        return self.display_title or self.title
 
 
 @dataclass
@@ -438,6 +448,8 @@ def _row_to_item(r: sqlite3.Row) -> Item:
         uid=r["uid"],
         source=r["source"],
         note=r["note"],
+        display_title=r["display_title"],
+        done=bool(r["done"]),
     )
 
 
@@ -523,8 +535,9 @@ def _feed_values(it: Item) -> tuple:
 def _take_over(row_id: int, it: Item, source: str, batch_id, uid: str, now: datetime) -> None:
     """Point an existing row at the feed item (same id, so /week and reminders follow)."""
     _db.execute(
-        f"UPDATE items SET {', '.join(f + '=?' for f in _FEED_FIELDS)}, source=?, uid=?, batch_id=COALESCE(?, batch_id) WHERE id=?",
-        (*_feed_values(it), source, it.uid, batch_id, row_id),
+        f"UPDATE items SET {', '.join(f + '=?' for f in _FEED_FIELDS)}, source=?, uid=?, batch_id=COALESCE(?, batch_id), "
+        "display_title=CASE WHEN title=? THEN display_title ELSE NULL END WHERE id=?",
+        (*_feed_values(it), source, it.uid, batch_id, it.title, row_id),
     )
     _db.execute("DELETE FROM reminders WHERE item_id = ? AND sent = 0", (row_id,))
     it.id, it.source = row_id, source
@@ -621,6 +634,71 @@ def add_event(user_id, it: Item, source: str) -> bool:
     _insert_item(uid, batch, source, it, datetime.now(TZ))
     _db.commit()
     return True
+
+
+def mark_done(user_id, query: str) -> Item | None:
+    """Mark the upcoming deadline or item best matching the query as done (reminders stop)."""
+    now = datetime.now(TZ)
+    cands = [i for i in existing_items(user_id) if not i.done and i.kind != "class"
+             and (i.due_date is None or due_datetime(i) >= now - timedelta(days=1))]
+    q = set(re.findall(r"[a-z0-9]+", query.lower())) - {"the", "a", "my", "done", "finished", "with", "i", "submitted"}
+    def overlap(i):
+        return len(q & set(re.findall(r"[a-z0-9]+", f"{i.title} {i.shown} {i.course}".lower())))
+    best = max(cands, key=lambda i: (overlap(i), -(due_datetime(i) - now).total_seconds() if i.due_date else 0), default=None)
+    if best is None or overlap(best) == 0:
+        return None
+    _db.execute("UPDATE items SET done = 1 WHERE id = ?", (best.id,))
+    _db.execute("DELETE FROM reminders WHERE item_id = ? AND sent = 0", (best.id,))
+    _db.commit()
+    best.done = True
+    return best
+
+
+_TITLE_JUNK = re.compile(r"^\s*(\[[^\]]{1,12}\]\s*)+|\s*-\s*Due\s*$|^Proctoring Enabled:\s*", re.I)
+_TITLE_EMOJI = re.compile("[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF\uFE0F\u200D]")
+
+TITLES_TASK = """Clean up calendar titles for a student's phone. Keep meaning and names; make them short
+(at most 6 words, 40 characters) and natural. Drop tags like [OOF], course codes, "Due", filler like
+"How to" when the rest is clear, and the student's own name ({owner}). Examples:
+"30 Min Meeting between Keith Mauppa and {owner}" -> "Meeting with Keith Mauppa"
+"How to Design Goods and Services That Fit the Operations Strategy" -> "Designing Goods and Services"
+"Weekly Economist Assignment #4 (Publication Date: September 26th)" -> "Economist Assignment #4"
+Keep numbers that tell items apart ("Ch 2", "#4"). If a title is already short and clear, return it as is.
+Return JSON: {{"titles": {{"<id>": "<clean title>"}}}}
+
+Titles:
+{titles}"""
+
+
+async def normalize_titles(user_id=None, owner: str | None = None) -> int:
+    """Clean titles that have no display title yet: deterministic cleanup, then one fast-model
+    call for the long or awkward ones. Cached in display_title; the original title is kept."""
+    import llm
+
+    q = "SELECT id, title, user_id FROM items WHERE display_title IS NULL" + (" AND user_id = ?" if user_id else "")
+    rows = _db.execute(q, (str(user_id),) if user_id else ()).fetchall()
+    if not rows:
+        return 0
+    cleaned, ask = {}, {}
+    for r in rows:
+        t = re.sub(r"\s+", " ", _TITLE_EMOJI.sub("", _TITLE_JUNK.sub("", r["title"]))).strip(" -,")
+        cleaned[r["id"]] = t or r["title"]
+        if len(t) > 40 or re.search(r"\bbetween\b|\bmin meeting\b|^how to\b|\(publication|\bfall 20\d\d\b", t, re.I):
+            ask[r["id"]] = t
+    for i in range(0, len(ask), 40):
+        chunk = dict(list(ask.items())[i:i + 40])
+        try:
+            data = await llm.chat_json([{"role": "user", "content": TITLES_TASK.format(
+                owner=owner or "the student", titles="\n".join(f"{k}: {v}" for k, v in chunk.items()))}])
+            for k, v in (data.get("titles") or {}).items():
+                v = re.sub(r"\s+", " ", str(v)).strip().replace("\u2014", ", ")
+                if k.isdigit() and int(k) in chunk and 0 < len(v) <= 60:
+                    cleaned[int(k)] = v
+        except Exception as e:
+            logging.getLogger("schedule").warning("title cleanup failed (%s)", type(e).__name__)
+    _db.executemany("UPDATE items SET display_title = ? WHERE id = ?", [(v, k) for k, v in cleaned.items()])
+    _db.commit()
+    return len(cleaned)
 
 
 def undo_last_file(user_id) -> tuple[str, int] | None:
@@ -867,7 +945,7 @@ def agenda_entries(user_id, start: date, end: date, now: datetime | None = None,
     time order: weekly classes, class sessions, meetings, events he's going to, deadlines and exams,
     from every source. /today, /week, schedule questions and the brief all use this."""
     now = now or datetime.now(TZ)
-    items = [i for i in existing_items(user_id) if kinds is None or i.kind in kinds]
+    items = [i for i in existing_items(user_id) if not i.done and (kinds is None or i.kind in kinds)]
     out: list[Entry] = []
     d = start
     while d <= end:
@@ -882,16 +960,17 @@ def agenda_entries(user_id, start: date, end: date, now: datetime | None = None,
                 when = fmt_time(i.due_time) if i.due_time else "All day"
                 if i.kind == "class_session":
                     title, who = split_class_title(i.title)
+                    title = i.display_title or title
                     day.append(Entry(d, i.due_time or time(0, 0), "class", when, title, course=i.course,
                                      place=i.room, who=who, item=i))
                 else:
                     kind = "event" if i.source and i.source not in CALENDAR_SOURCES else "meeting"
-                    day.append(Entry(d, i.due_time or time(0, 0), kind, when, i.title, place=i.room, item=i))
+                    day.append(Entry(d, i.due_time or time(0, 0), kind, when, i.shown, place=i.room, item=i))
             elif i.kind in DEADLINE_KINDS and i.due_date == d:
                 when = fmt_time(i.due_time) if i.due_time else "any time"
                 note = "Needs LockDown Browser" if i.note and "LockDown" in i.note else None
                 day.append(Entry(d, i.due_time or END_OF_DAY, "exam" if i.kind == "exam" else "deadline", when,
-                                 i.title, course=i.course, note=note, item=i))
+                                 i.shown, course=i.course, note=note, item=i))
         out += sorted(day, key=lambda e: e.sort)
         d += timedelta(days=1)
     return out

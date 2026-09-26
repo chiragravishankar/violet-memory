@@ -285,8 +285,8 @@ async def weekly(user_id, now: datetime | None = None) -> View:
         top = sorted(sorted(es, key=lambda e: rank[e.kind])[:2], key=lambda e: e.sort)
         rows.append(fmt.day_header(day))
         for e in top:
-            when = f"due {e.time_text}" if e.kind in ("deadline", "exam") else e.time_text
-            rows.append(fmt.time_line(when, fmt.short_title(e.title, e.course, limit=36), e.kind))
+            title = fmt.short_title(e.title, e.course, limit=36) + (" due" if e.kind in ("deadline", "exam") else "")
+            rows.append(fmt.time_line(e.time_text, title, e.kind))
         if len(es) > 2:
             rows.append(f"↳ +{len(es) - 2} more")
     days = ["\n".join(rows)] if rows else []

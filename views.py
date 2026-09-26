@@ -18,8 +18,8 @@ BRIEF_BUTTONS = [[("📅 Full week", "week:0:new"), ("🎟 Events", "events")]]
 def entry_lines(e: Entry, today: date | None = None, extra: str | None = None) -> list[str]:
     """One agenda entry: bold time line, then ↳ details."""
     if e.kind in ("deadline", "exam"):
-        lines = [fmt.time_line(f"due {e.time_text}" if e.time_text != "any time" else "due today",
-                               fmt.short_title(e.title, e.course), e.kind)]
+        when = e.time_text if e.time_text != "any time" else "Any time"
+        lines = [fmt.time_line(when, f"{fmt.short_title(e.title, e.course)} due", e.kind)]
         lines.append(fmt.sub(e.course, "🔒 Needs LockDown Browser" if e.note else None))
     else:
         title = fmt.short_title(e.title)
@@ -100,7 +100,7 @@ def period_view(user_id, start: date, end: date, period: str, kinds: set[str] | 
                 lead: str | None = None) -> View:
     """Answer to a schedule question, same layout as /week. Empty period: say so, then what's next."""
     what = "due" if kinds and kinds <= schedule.DEADLINE_KINDS else ("meetings" if kinds == {"event"} else "on")
-    title = {"due": "Due", "meetings": "Meetings", "on": "Schedule"}[what] + f" {period}"
+    title = {"due": "Due", "meetings": "Meetings", "on": "Schedule"}[what] + (f" {period}" if period else "")
     entries = schedule.agenda_entries(user_id, start, end, now, kinds)
     if entries:
         return agenda_view(user_id, start, end, now, title, kinds, lead=lead)
@@ -184,20 +184,21 @@ def reminder_view(it: schedule.Item, lead: str, context: str | None = None) -> V
     """Compact reminder: "⏰ <b>In 30 min</b>", the item with its time, ↳ details, ↳ context."""
     head = f"⏰ <b>{esc(_LEAD_HEAD.get(lead, 'Reminder'))}</b>"
     if it.kind in ("class", "class_session"):
-        title, who = schedule.split_class_title(it.title) if it.kind == "class_session" else (it.course or it.title, None)
+        title, who = schedule.split_class_title(it.title) if it.kind == "class_session" else (it.course or it.shown, None)
+        title = it.display_title or title
         t = it.start_time if it.kind == "class" else it.due_time
         line = f"🎓 {esc(fmt.short_title(title))} · {fmt.fmt_time(t)}" if t else f"🎓 {esc(title)}"
         details = [fmt.sub(it.room, who)]
     elif it.kind in schedule.DEADLINE_KINDS:
         icon = "📝" if it.kind == "exam" else "📌"
-        line = f"{icon} {esc(fmt.short_title(it.title, it.course))} · {esc(schedule.fmt_due(it))}"
+        line = f"{icon} {esc(fmt.short_title(it.shown, it.course))} · {esc(schedule.fmt_due(it))}"
         details = [fmt.sub(it.course, "🔒 Needs LockDown Browser" if it.note and "LockDown" in it.note else None)]
     else:
         icon = "🎟" if it.source and it.source not in schedule.CALENDAR_SOURCES else "🤝"
         when = fmt.fmt_time(it.due_time) if it.due_time else "all day"
         if lead in ("1d", "approval", "1w", "3d"):
             when = schedule.fmt_due(it)
-        line = f"{icon} {esc(fmt.short_title(it.title))} · {esc(when)}"
+        line = f"{icon} {esc(fmt.short_title(it.shown))} · {esc(when)}"
         details = [fmt.sub(it.room)]
         if lead == "approval":
             details.append(fmt.sub("Needs host approval, check you got in"))

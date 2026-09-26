@@ -17,6 +17,7 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+import agent
 import assistant
 import brain  # loads .env
 import brief
@@ -350,52 +351,64 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
         await _event_reply(update, context, user_id, text, *action)
         return
 
-    recent = recent_replies(user_id)
-    c = await assistant.classify(text, user_id=user_id, recent=recent)
-    label = c.type + ("+schedule" if c.about_schedule else "") + ("+about_user" if c.about_user else "")
-    log.info("classified %r as %s", text[:80], label)
-    set_classification(rows, label)
-
-    if c.type == assistant.CORRECTION:
-        answer = await _with_typing(update, context, assistant.correct(user_id, text, last_reply(user_id), recent))
+    # "I am Chirag Ravishankar": set the name in code, no model involved.
+    m_name = assistant._NAME.match(text)
+    if m_name and assistant._looks_like_name(m_name.group(1)):
+        set_classification(rows, "correction")
+        answer = await _with_typing(update, context, assistant.correct(user_id, text, last_reply(user_id), recent_replies(user_id)))
+        agent.remember_turn(user_id, "user", text)
+        agent.remember_turn(user_id, "assistant", answer)
         await reply(update, answer)
         context.application.create_task(brain.connect(user_id), update=update)
         context.application.create_task(sync_profile(user_id))
         return
 
-    # Learn lasting facts in the background; never slows the reply.
+    # Everything else: the conversational agent decides what he wants and which tools to use.
+    set_classification(rows, "agent")
+    try:
+        r = await _with_typing(update, context, agent.respond(user_id, text))
+    except Exception:
+        log.exception("agent failed")
+        await reply(update, "Sorry, my head's a bit foggy right now. Try me again in a moment?")
+        return
+    set_classification(rows, "agent:" + (",".join(dict.fromkeys(r.tools)) or "chat"))
+    await _send_agent_reply(update, context, r)
+    if r.connect:
+        context.application.create_task(brain.connect(user_id), update=update)
+    # Learn lasting facts about him in the background; never slows the reply.
     context.application.create_task(_learn(user_id, text))
 
-    if c.type == assistant.QUESTION and assistant.is_event_question(text):
-        await reply_any(update, context, await _with_typing(update, context, assistant.answer_events(user_id, text, recent=recent)))
-        return
-    if c.type == assistant.QUESTION:
-        answer = await _with_typing(
-            update, context, assistant.answer(user_id, text, c.about_schedule, about_user=c.about_user, recent=recent)
-        )
-        await reply_any(update, context, answer)
-        return
 
-    # Reply first; the save runs in the background. cognee.add waits for any graph build
-    # already running on this dataset, which could hold the reply up for many seconds.
-    context.application.create_task(_remember(user_id, text))
-
-    if c.type == assistant.SCHEDULE:
-        try:
-            draft = await _with_typing(update, context, ingest.process_chat(user_id, text))
-        except Exception:
-            log.exception("chat schedule extraction failed")
-            draft = None
-        if draft:
-            await speak(update, draft.text, kind=draft.kind, user_message=text)
-        else:
-            await speak(update, "Kept it, but there was no clear date or time to put on his calendar. "
-                                "Ask when, if it matters.", kind="save", user_message=text)
-        return
-    if c.ack:
-        await reply(update, c.ack)  # written in the same call as the classification
+async def _send_agent_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, r) -> None:
+    """Text, then any formatted views (the text becomes the first view's lead-in), buttons last."""
+    chat_id = update.effective_chat.id
+    buttons = [list(r.buttons)] if r.buttons else []
+    if r.views:
+        for n, v in enumerate(r.views):
+            html = v.html
+            if n == 0 and r.text:
+                html = f"{fmt.esc(r.text)}\n\n{html}"
+            last = n == len(r.views) - 1
+            await send_view(context.bot, chat_id, View(html, v.buttons + (buttons if last else []), v.more))
+    elif buttons or _URL.search(r.text or ""):
+        # Raw links become tappable text; buttons need an HTML message anyway.
+        await send_view(context.bot, chat_id, View(_linkify(r.text or "Here you go."), buttons))
     else:
-        await speak(update, "Kept it. Acknowledge the specific thing.", kind="save", user_message=text)
+        await reply(update, r.text or "Hmm, I lost my train of thought there. Say that again?")
+
+
+_URL = re.compile(r"https?://[^\s<>()]+[^\s<>().,!?;:'\"]")
+
+
+def _linkify(text: str) -> str:
+    """Escape text and turn raw URLs into tappable "Link" text."""
+    out, last = [], 0
+    for m in _URL.finditer(text):
+        out.append(fmt.esc(text[last:m.start()]))
+        out.append(fmt.link(m.group(0), "Link"))
+        last = m.end()
+    out.append(fmt.esc(text[last:]))
+    return "".join(out)
 
 
 async def _event_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id, text: str,
@@ -410,6 +423,8 @@ async def _event_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     if action == "going":
         context.application.create_task(brain.connect(user_id))
     await speak(update, " ".join(drafts), kind="confirmation", user_message=text)
+    agent.remember_turn(user_id, "user", text)
+    agent.remember_turn(user_id, "assistant", last_reply(user_id) or " ".join(drafts))
 
 
 async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -821,6 +836,8 @@ async def sync_feeds(app: Application) -> None:
         results = await feeds.sync_all()
         if any(not isinstance(r, str) and r.added for r in results.values()):
             app.create_task(brain.connect(feeds.calendar_user()))
+        # Clean up new or changed titles once ("30 Min Meeting between ..." -> "Meeting with ...").
+        await schedule.normalize_titles(owner=selfmodel.owner_name(feeds.calendar_user()) if feeds.calendar_user() else None)
         await asyncio.sleep(feeds.SYNC_EVERY.total_seconds())
 
 

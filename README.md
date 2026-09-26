@@ -104,6 +104,23 @@ previews what would fire at that moment.
 - Messages from one user that arrive within 3 seconds are joined, so a long paste that
   Telegram splits is handled as one message (every text reply waits that long).
 
+## Conversation
+
+- `agent.py`: every non-command message (typed or a voice transcript) goes to one tool-calling
+  model (`CHAT_MODEL`, default gpt-5.4: about 0.7 s per call with tools; background jobs stay on
+  the fast model). Tools wrap existing functions: get_agenda, get_next_items, search_memory,
+  get_profile, find_events, respond_to_event, find_people, get_followups, save_memory,
+  add_schedule_item, add_person, mark_done, update_profile, render_view, add_button.
+- The last 12 messages (both sides) are kept in SQLite and sent with every call, plus what was last
+  shown (event list, schedule range), so "what about Monday?" and "the second one" work.
+- Rules: answer exactly what was asked (tomorrow means tomorrow), an empty day gets one sentence plus
+  the next item and a [📅 Show my week] button, lists only when a list is the best answer, declines
+  and corrections are understood, normal conversation is welcome, and only durable facts are saved.
+- Fast paths stay in code: onboarding, profile edits, reflection answers, "going" / "not for me" on
+  the last event list, and "I am <name>".
+- Calendar titles are cleaned once by the fast model and cached (`display_title`); the original
+  title is kept for matching.
+
 ## Formatting and the daily brief
 
 - `fmt.py`: the one formatter (Telegram HTML). Section headers "📅 <b>TODAY</b>", bold times

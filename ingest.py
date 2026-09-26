@@ -55,6 +55,7 @@ async def process_file(user_id, path: Path, file_name: str, caption: str | None)
 
     items = await schedule.extract(extracted.text, _context(file_name, caption))
     result = schedule.add_items(user_id, items, source="file", label=name)
+    await schedule.normalize_titles(user_id, selfmodel.owner_name(user_id))
     facts = [f"Read {name}{pages}, and will remember what's in it."]
     if result.added:
         facts.append(f"Added {_count_words(result)} to his calendar (listed below). /undo removes them.")
