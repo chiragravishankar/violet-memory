@@ -8,7 +8,9 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import contextvars
 import secrets
+import uuid
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
@@ -25,8 +27,10 @@ import ingest
 import onboarding
 import schedule
 import selfmodel
+import transcribe
 import views
 import voice
+import fmt
 from fmt import View
 
 logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
@@ -66,6 +70,22 @@ if "classification" not in {r[1] for r in _db.execute("PRAGMA table_info(message
 _db.commit()
 
 
+_db.execute("""CREATE TABLE IF NOT EXISTS voice_transcripts (
+    token TEXT PRIMARY KEY, user_id INTEGER, text TEXT NOT NULL, created_at TEXT NOT NULL)""")
+_db.commit()
+
+# Set while a voice note is being handled: the first reply gets the 🎙 quote on top and a
+# [📝 Full transcript] button, whichever path (answer, save, view) produces it.
+_voice_note: contextvars.ContextVar[dict | None] = contextvars.ContextVar("voice_note", default=None)
+
+
+def _take_voice_note() -> dict | None:
+    note = _voice_note.get()
+    if note is not None:
+        _voice_note.set(None)
+    return note
+
+
 def log_message(direction: str, update: Update, text: str | None, classification: str | None = None) -> int:
     user = update.effective_user
     chat = update.effective_chat
@@ -102,7 +122,16 @@ def recent_replies(user_id, n: int = 5) -> list[str]:
 
 async def reply(update: Update, text: str) -> None:
     """Send text that is already in Violet's voice."""
-    await update.effective_message.reply_text(text)
+    note = _take_voice_note()
+    if note is None:
+        await update.effective_message.reply_text(text)
+    else:
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("📝 Full transcript", callback_data=f"tr:{note['token']}")]])
+        try:
+            await update.effective_message.reply_text(f"{note['quote']}\n\n{fmt.esc(text)}", parse_mode=ParseMode.HTML,
+                                                      reply_markup=markup, disable_web_page_preview=True)
+        except BadRequest:
+            await update.effective_message.reply_text(f"{fmt.to_plain(note['quote'])}\n\n{text}", reply_markup=markup)
     log_message("out", update, text)
 
 
@@ -120,6 +149,9 @@ def _markup(v: View) -> InlineKeyboardMarkup | None:
 
 async def send_view(bot, chat_id: int, v: View, edit_message=None) -> None:
     """Send (or edit) a structured view as HTML; if Telegram rejects the formatting, resend plain."""
+    note = _take_voice_note() if edit_message is None else None
+    if note is not None:
+        v = View(f"{note['quote']}\n\n{v.html}", v.buttons + [[("📝 Full transcript", f"tr:{note['token']}")]], v.more)
     markup = _markup(v)
     try:
         if edit_message is not None:
@@ -181,14 +213,15 @@ def _kind(msg) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
-    await speak(update, "First hello. You're Violet: he can text you anything to keep (people he meets, "
-                        "events, ideas, deadlines), ask you anything about it, and send files like a syllabus. "
+    await speak(update, "First hello. You're Violet: he can text or voice-note you anything to keep (people he "
+                        "meets, events, ideas, deadlines), ask you anything about it, and send files like a syllabus. "
                         "Two short sentences.", kind="info")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
-    await speak(update, "Quick how-to: text you anything to keep it, ask anything in plain words, send a PDF, "
+    await speak(update, "Quick how-to: text or send a voice note (up to 5 minutes) with anything to keep, ask "
+                        "anything in plain words, send a PDF, "
                         "Word file or photo (a caption like 'OM syllabus' helps). Commands are listed below.",
                 kind="info", attach=COMMANDS)
 
@@ -472,6 +505,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if action == "going":
             context.application.create_task(brain.connect(user_id))
         await speak(update, draft, kind="confirmation", user_message=f"(tapped {action} on {e.title})")
+    elif data.startswith("tr:"):
+        row = _db.execute("SELECT text FROM voice_transcripts WHERE token = ?", (data[3:],)).fetchone()
+        text = f"📝 <b>TRANSCRIPT</b>\n\n<i>{fmt.esc(row[0])}</i>" if row else "That transcript isn't around anymore."
+        await send_view(context.bot, update.effective_chat.id, View(text))
     elif data.startswith("more:"):
         pages = _more_pages.pop(data[5:], None)
         if not pages:
@@ -700,6 +737,52 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.application.create_task(brain.connect(user_id), update=update)
 
 
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Voice notes, audio files and video notes: transcribe, then handle exactly like typed text."""
+    msg = update.effective_message
+    media = msg.voice or msg.audio or msg.video_note
+    user_id = update.effective_user.id
+    duration = getattr(media, "duration", 0) or 0
+    if duration > transcribe.MAX_SECONDS:
+        log_message("in", update, f"[voice {duration}s, too long]")
+        await speak(update, f"That note is {duration // 60} minutes long; you can take up to 5. Ask him for a "
+                            "shorter one or to split it.", kind="error")
+        return
+    await update.effective_chat.send_action(ChatAction.TYPING)
+    if msg.voice:
+        ext = ".ogg"
+    elif msg.video_note:
+        ext = ".mp4"
+    else:
+        ext = Path(msg.audio.file_name or "").suffix.lower() or {"audio/mpeg": ".mp3", "audio/mp4": ".m4a"}.get(msg.audio.mime_type or "", ".ogg")
+    tmp = FILES_DIR.parent / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    path = tmp / f"{uuid.uuid4().hex}{ext}"
+    try:
+        f = await media.get_file()
+        await f.download_to_drive(path)
+        text = await _with_typing(update, context, transcribe.transcribe(path, user_id))
+    except Exception as e:
+        log.warning("voice note failed (%s)", type(e).__name__)
+        text = ""
+    finally:
+        path.unlink(missing_ok=True)  # keep the transcript, never the audio
+    if not text:
+        log_message("in", update, "[voice] (nothing transcribed)")
+        await reply(update, "Couldn't catch that, mind trying again or typing it?")
+        return
+    row = log_message("in", update, f"[voice] {text}")
+    token = uuid.uuid4().hex[:12]
+    _db.execute("INSERT INTO voice_transcripts (token, user_id, text, created_at) VALUES (?, ?, ?, ?)",
+                (token, user_id, text, datetime.now(timezone.utc).isoformat()))
+    _db.commit()
+    _voice_note.set({"quote": f"🎙 <i>\"{fmt.esc(transcribe.preview(text))}\"</i>", "token": token})
+    try:
+        await handle_text(update, context, text, [row])
+    finally:
+        _voice_note.set(None)
+
+
 async def on_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
     await speak(update, "You can only read text, files and photos for now, not this kind of message.", kind="error",
@@ -850,6 +933,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, on_voice))
     app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, on_other))
     app.add_error_handler(on_error)
 

@@ -182,8 +182,9 @@ def _near(a: str, b: str) -> bool:
 
 
 def _strip_name(text: str, person: dict) -> str:
-    name = person.get("attrs", {}).get("name", "")
-    return re.sub(rf"^{re.escape(name)}\s+", "", text, flags=re.I) if name else text
+    """"Priya: building fintech agents" -> "building fintech agents" when adding to Priya's entry."""
+    name = _person_name(person)
+    return re.sub(rf"^{re.escape(name)}\s*[:,-]?\s+", "", text, flags=re.I) if name else text
 
 
 def _flat_attrs(attrs, section: str) -> dict:

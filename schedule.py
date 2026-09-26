@@ -103,7 +103,8 @@ Rules:
   is written explicitly in the text. Never invent or guess dates. Skip items with only
   vague timing like "week 5", "mid-semester", "TBA" or "later".
 - Resolve the year from the semester: Aug to Dec is 2026, Jan is 2027.
-- time is 24h HH:MM only if a time is written for that item, else null.
+- time is 24h HH:MM only if a time is written for that item, else null. "Midnight" on a day means
+  the end of that day (23:59), "noon" is 12:00.
 - Midterms and finals are kind "exam". Project proposals, drafts and presentations are "project".
 - course: short course name or code. Use the context (file caption or name) when the text
   does not say which course. Empty string if unknown.
