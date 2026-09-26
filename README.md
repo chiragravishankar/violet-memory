@@ -11,6 +11,11 @@ with `?` and it answers from your memories. Each user's memory is private.
 - `assistant.py`: classifies each message (question, schedule item, memory), answers
   schedule questions from the calendar plus Cognee, builds class reminder context.
 - `feeds.py`: Brightspace and Google Calendar iCal sync (now and every 3 hours).
+- `selfmodel.py`: the user's profile (identity, academics, goals, people, preferences,
+  patterns). Each fact has source, stated or inferred, confidence, first seen and last
+  confirmed. Mirrored into Cognee as one "me" document tagged `node_set=["core_profile"]`.
+  Other features use `get_profile(user_id)` and `profile_summary(user_id)`.
+- `onboarding.py`: `/me setup`, seven questions, skip / later / resume, confirm at the end.
 - `data/`: created on first run. Holds Cognee's databases and `messages.db`
   (SQLite log of every inbound and outbound message).
 
@@ -69,6 +74,17 @@ classes 30 minutes before with a line of context from memory; other timed events
 marked sent before sending, so restarts never repeat one, and reminders missed
 while the bot was off for over an hour are dropped. `/demo_time 2026-09-29 13:30`
 previews what would fire at that moment.
+
+## Profile
+
+- `/me` shows the profile ("you told me" vs "I noticed"), `/me setup` onboarding,
+  `/me edit <correction>`, `/me reflect` for the weekly check-in now (it also runs Sunday
+  from 6 PM), `/forget <text>` removes matching facts and saved chat messages.
+- After each message a background check stores lasting facts and ignores one-offs.
+- Resumes and LinkedIn exports sent as files seed the profile.
+- Sensitive topics (health, finances, religion, politics, romantic life) are never stored,
+  enforced in code, unless you explicitly ask ("remember that ...", or `/me edit`).
+- Quiet hours delay non-urgent reminders (1 week, 3 days, 1 day) to the end of them.
 
 ## Calendar feeds
 

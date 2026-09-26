@@ -697,10 +697,16 @@ def ensure_class_reminders(now: datetime | None = None) -> None:
     _db.commit()
 
 
-def pop_due_reminders(now: datetime | None = None) -> list[tuple[str, Item, str]]:
+NON_URGENT_LEADS = {"1w", "3d", "1d"}  # these wait out quiet hours; 3h, 1h and 30m do not
+
+
+def pop_due_reminders(now: datetime | None = None, quiet_until=None) -> list[tuple[str, Item, str]]:
     """(user_id, item, lead) for every reminder that is due. Each is marked sent before
     it is returned, so a crash or restart can never send it twice. Reminders missed
-    while the bot was off for more than an hour are dropped rather than sent late."""
+    while the bot was off for more than an hour are dropped rather than sent late.
+
+    quiet_until(user_id, now) -> datetime | None: when given, non-urgent reminders that fall
+    in the user's quiet hours are moved to the end of them instead of being sent."""
     now = now or datetime.now(TZ)
     rows = _db.execute(
         """SELECT r.id AS rid, r.user_id AS ruser, r.lead, r.remind_at, i.* FROM reminders r
@@ -710,6 +716,16 @@ def pop_due_reminders(now: datetime | None = None) -> list[tuple[str, Item, str]
     ).fetchall()
     out = []
     for r in rows:
+        if quiet_until and r["lead"] in NON_URGENT_LEADS and now - datetime.fromisoformat(r["remind_at"]) <= STALE_AFTER:
+            until = quiet_until(r["ruser"], now)
+            if until:
+                try:
+                    _db.execute("UPDATE reminders SET remind_at = ? WHERE id = ?",
+                                (until.astimezone(timezone.utc).isoformat(), r["rid"]))
+                    _db.commit()
+                    continue
+                except sqlite3.IntegrityError:
+                    pass  # an identical reminder already waits there: send this one now
         _db.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (r["rid"],))
         _db.commit()
         if now - datetime.fromisoformat(r["remind_at"]) > STALE_AFTER:

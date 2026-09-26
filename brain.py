@@ -68,13 +68,18 @@ def document_memory(file_name: str, caption: str | None, text: str) -> str:
     return "\n".join(header) + "\n\n" + text
 
 
-async def recall_raw(user_id: int | str, question: str) -> str:
+def _search_kwargs(system_prompt: str | None) -> dict:
+    return {"system_prompt": system_prompt} if system_prompt else {}
+
+
+async def recall_raw(user_id: int | str, question: str, system_prompt: str | None = None) -> str:
     """Cognee's answer from this user's memories, or "" if there is none or search fails."""
     try:
         results = await cognee.search(
             query_text=question,
             query_type=SearchType.GRAPH_COMPLETION,
             datasets=[dataset_for(user_id)],
+            **_search_kwargs(system_prompt),
         )
     except Exception as e:
         log.info("search failed for %s: %s", dataset_for(user_id), type(e).__name__)
@@ -82,8 +87,9 @@ async def recall_raw(user_id: int | str, question: str) -> str:
     return _first_text(results)
 
 
-async def recall(user_id: int | str, question: str) -> str:
-    """Answer a question using only this user's memories."""
+async def recall(user_id: int | str, question: str, system_prompt: str | None = None) -> str:
+    """Answer a question using only this user's memories. system_prompt replaces Cognee's
+    default answer instructions (used to pass the user's profile and reply style)."""
     ds = dataset_for(user_id)
     connecting = is_connecting(user_id)
     note = "\n\n(New memories may take a few seconds to connect.)" if connecting else ""
@@ -93,6 +99,7 @@ async def recall(user_id: int | str, question: str) -> str:
             query_text=question,
             query_type=SearchType.GRAPH_COMPLETION,
             datasets=[ds],
+            **_search_kwargs(system_prompt),
         )
     except Exception as e:
         log.info("search failed for %s: %s", ds, e)
@@ -124,3 +131,35 @@ def _first_text(results) -> str:
         if text:
             return text.replace("—", ", ").replace("**", "")
     return ""
+
+
+# Items in memory that /forget must never delete wholesale: files and calendar summaries.
+_BULK_PREFIXES = ("Document:", "New items from my", "Core profile of")
+
+
+async def forget_text(user_id: int | str, text: str) -> int:
+    """Delete saved chat memories that mention text. Documents, calendar summaries and the
+    profile document are kept (the profile is rewritten by the caller). Returns the count."""
+    needle = text.strip().lower()
+    if not needle:
+        return 0
+    try:
+        ds = next(d for d in await cognee.datasets.list_datasets() if d.name == dataset_for(user_id))
+        items = await cognee.datasets.list_data(ds.id)
+    except (StopIteration, Exception) as e:
+        log.info("forget: could not list memories (%s)", type(e).__name__)
+        return 0
+    removed = 0
+    for d in items:
+        try:
+            content = Path(str(d.raw_data_location).replace("file://", "")).read_text(errors="replace")
+        except Exception:
+            continue
+        if content.startswith(_BULK_PREFIXES) or needle not in content.lower():
+            continue
+        try:
+            await cognee.datasets.delete_data(ds.id, d.id)
+            removed += 1
+        except Exception as e:
+            log.info("forget: delete failed (%s)", type(e).__name__)
+    return removed

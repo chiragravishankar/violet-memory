@@ -7,6 +7,7 @@ from pathlib import Path
 import brain
 import docs
 import schedule
+import selfmodel
 
 log = logging.getLogger("ingest")
 
@@ -34,11 +35,24 @@ async def process_file(user_id, path: Path, file_name: str, caption: str | None)
         return f"I couldn't find any text in {name} 💜"
 
     await brain.save(user_id, brain.document_memory(file_name, caption, extracted.text))
+    pages = f" ({_plural(extracted.pages, 'page')})" if extracted.pages else ""
+
+    if await selfmodel.is_resume(extracted.text, caption, file_name):
+        added = await selfmodel.seed_from_resume(user_id, extracted.text)
+        lines = [f"📄 Read {name}{pages}. Saved to memory."]
+        if added:
+            lines.append("🪞 Added to your profile:")
+            lines += [f"• {f['text']}" for f in added[:10]]
+            if len(added) > 10:
+                lines.append(f"...and {len(added) - 10} more.")
+            lines.append("Send /me to see it all, or /me edit to fix anything.")
+        else:
+            lines.append("It looks like a resume, but I didn't find anything new for your profile.")
+        return "\n".join(lines)
 
     items = await schedule.extract(extracted.text, _context(file_name, caption))
     result = schedule.add_items(user_id, items, source="file", label=name)
 
-    pages = f" ({_plural(extracted.pages, 'page')})" if extracted.pages else ""
     lines = [f"📄 Read {name}{pages}. Saved to memory."]
     lines += summarize(result)
     if result.added:

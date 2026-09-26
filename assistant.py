@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import brain
 import llm
 import schedule
+import selfmodel
 from schedule import TZ
 
 log = logging.getLogger("assistant")
@@ -36,6 +37,8 @@ Message: \"\"\"{text}\"\"\""""
 ANSWER_PROMPT = """You are Violet Memory, a friendly personal memory assistant for a student.
 Now: {now} (America/New_York).
 
+About them: {profile}
+
 The agenda below is COMPLETE for {period} ({start} to {end}) and already filtered to what the
 question asks about ({kinds}), from all their calendars. Answer from it:
 - List every agenda item. Never drop, merge, move or invent items.
@@ -47,7 +50,8 @@ question asks about ({kinds}), from all their calendars. Answer from it:
   list every "Coming up after" item (if any) under a short "Next up:" line.
 - Use the memory notes only to add a short helpful detail if relevant.
 
-Style: short and friendly, plain text only. No markdown, no asterisks, no em dashes.
+Style: friendly, plain text only, following their reply style preference if they have one
+(short by default). No markdown, no asterisks, no em dashes.
 
 Agenda:
 {agenda}
@@ -60,6 +64,29 @@ Memory notes:
 
 Question: {question}"""
 
+ADVICE_PROMPT = """You are Violet Memory, a friendly personal assistant for a student who knows them well.
+Now: {now} (America/New_York).
+
+About them (goals, projects, people, preferences): {profile}
+
+Their agenda for {period} ({start} to {end}), complete, from all calendars:
+{agenda}
+
+Hard deadlines in this period (every one of these must appear in your priorities, with its day and time):
+{deadlines}
+
+Memory notes: {memory}
+
+Question: {question}
+
+Give 3 to 5 concrete priorities. Hard deadlines first, in date order (you may group several
+into one line). Then tie the rest to their goals and projects by name. Only use dates and times
+that are in the agenda; don't invent times for goal work. If a teammate or mentor is relevant, mention them.
+Plain text, numbered lines, no markdown, no asterisks, no em dashes. Follow their reply style
+preference (short by default)."""
+
+_ADVICE = re.compile(r"\b(focus|prioriti[sz]e|priorities|plan my|should i|what should|where should|how should|advice)\b", re.I)
+
 _SCHEDULE_WORDS = re.compile(
     r"\b(schedule|calendar|agenda|due|deadline|class|classes|lecture|meeting|meetings|exam|exams|"
     r"quiz|assignment|assignments|homework|busy|free|plans?|week|today|tomorrow|tonight|weekend)\b",
@@ -68,6 +95,7 @@ _SCHEDULE_WORDS = re.compile(
 
 
 CONTEXT_PROMPT = """Write ONE short line (max 25 words) to add to a class reminder for {course}.
+About the student: {profile}
 Use only these facts. Mention teammates or people if the memory names any for this course, and the
 next deadline if there is one. Do not start with "Reminder". Plain text, no markdown, no em dashes, no emoji.
 If there are no useful facts, return exactly: none
@@ -117,6 +145,15 @@ def _kinds_label(kinds: set[str] | None) -> str:
     return " and ".join(names)
 
 
+def memory_system_prompt(profile: str) -> str:
+    """Cognee answer instructions with the user's profile, so memory answers fit them."""
+    return (
+        "Answer the question using the provided context. The user is the person described here: "
+        f"{profile}. Speak to them as \"you\". Be friendly and brief (match their reply style "
+        "preference if one is given). Plain text, no markdown, no em dashes."
+    )
+
+
 def is_schedule_question(question: str, about_schedule: bool, today) -> bool:
     return about_schedule or bool(_SCHEDULE_WORDS.search(question)) or schedule.parse_range(question, today) is not None
 
@@ -125,20 +162,38 @@ async def answer(user_id, question: str, about_schedule: bool, now: datetime | N
     """Schedule questions: the same agenda as /week for the period the question names
     (default the next 7 days), plus Cognee context. Other questions: Cognee alone."""
     now = now or datetime.now(TZ)
-    if not is_schedule_question(question, about_schedule, now.date()):
-        return await brain.recall(user_id, question)
+    profile = selfmodel.profile_summary(user_id) or "nothing yet"
+    advice = bool(_ADVICE.search(question))
+    if not advice and not is_schedule_question(question, about_schedule, now.date()):
+        return await brain.recall(user_id, question, system_prompt=memory_system_prompt(profile))
     start, end, period = schedule.parse_range(question, now.date()) or (
         now.date(), now.date() + timedelta(days=6), "the next 7 days"
     )
+    if advice:
+        # Planning needs room to look ahead, even when "this week" is only the weekend.
+        end = max(end, now.date() + timedelta(days=6))
+        lines = schedule.agenda_lines(user_id, start, end, now)
+        deadlines = schedule.agenda_lines(user_id, start, end, now, schedule.DEADLINE_KINDS)
+        memory = await brain.recall_raw(user_id, question, system_prompt=memory_system_prompt(profile))
+        prompt = ADVICE_PROMPT.format(
+            now=f"{now:%A %b} {now.day}, {now.year}, {schedule.fmt_time(now.time())}",
+            profile=profile, period=period if end == start else "the coming days",
+            start=schedule.fmt_day(start), end=schedule.fmt_day(end),
+            agenda="\n".join(lines) or "(nothing scheduled)", memory=memory or "none", question=question,
+            deadlines="\n".join(deadlines) or "(none)",
+        )
+        log.info("advice question: %s to %s, %d agenda lines", start, end, len(lines))
+        return _plain(await llm.chat([{"role": "user", "content": prompt}]))
     kinds = schedule.parse_kinds(question)
     lines = schedule.agenda_lines(user_id, start, end, now, kinds)
     # Only offered when the period is empty, so the answer can't wander past it.
     after = [] if lines else schedule.agenda_lines(user_id, end + timedelta(days=1), end + timedelta(days=7), now, kinds)
     log.info("schedule question: %s, %s to %s, kinds %s, %d agenda lines",
              period, start, end, sorted(kinds) if kinds else "all", len(lines))
-    memory = await brain.recall_raw(user_id, question)
+    memory = await brain.recall_raw(user_id, question, system_prompt=memory_system_prompt(profile))
     prompt = ANSWER_PROMPT.format(
         now=f"{now:%A %b} {now.day}, {now.year}, {schedule.fmt_time(now.time())}",
+        profile=profile,
         period=period,
         start=schedule.fmt_day(start),
         end=schedule.fmt_day(end),
@@ -159,7 +214,8 @@ async def class_context(user_id, it: schedule.Item, now: datetime) -> str | None
     memory = await brain.recall_raw(
         user_id, f"Who are my teammates or group members in {course}, and what have I noted about {course}?"
     )
-    prompt = CONTEXT_PROMPT.format(course=course, next_due=next_due, memory=memory or "none")
+    prompt = CONTEXT_PROMPT.format(course=course, next_due=next_due, memory=memory or "none",
+                                   profile=selfmodel.profile_summary(user_id, max_words=60) or "nothing yet")
     try:
         line = _plain(await llm.chat([{"role": "user", "content": prompt}])).splitlines()[0].strip()
     except Exception as e:
