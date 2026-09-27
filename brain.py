@@ -57,6 +57,7 @@ def anchor(user_id: int | str, text: str, kind: str = "message") -> str:
         "document": f"{who} shared this document:",
         "calendar": f"From the calendar of {who}:",
         "correction": f"Correction from {who}, this replaces anything that said otherwise:",
+        "email": f"From an email {who} received (a summary, not the email itself):",
     }[kind]
     return f"{head}\n{text}"
 

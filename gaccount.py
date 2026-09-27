@@ -18,7 +18,9 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly",  # inbox awareness: read only, never modify
 ]
+READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 LOGIN_TIMEOUT = 300  # seconds to finish the browser login
 
 
@@ -38,7 +40,7 @@ def credentials():
 
     if not TOKEN_FILE.exists():
         raise NotConnected("no token")
-    creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), granted_scopes() or SCOPES)
     if creds.valid:
         return creds
     if creds.expired and creds.refresh_token:
@@ -49,6 +51,20 @@ def credentials():
         _save(creds)
         return creds
     raise NotConnected("token not usable")
+
+
+def granted_scopes() -> list[str]:
+    """The scopes the saved grant actually has (older grants may lack newer scopes)."""
+    import json
+
+    try:
+        return list(json.loads(TOKEN_FILE.read_text()).get("scopes") or [])
+    except Exception:
+        return []
+
+
+def can_read_mail() -> bool:
+    return READ_SCOPE in granted_scopes() and connected()
 
 
 def connected() -> bool:

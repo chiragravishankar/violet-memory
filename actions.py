@@ -138,8 +138,15 @@ def email_known(user_id, address: str) -> bool:
             return True
     except Exception:
         pass
-    return bool(_db.execute("SELECT 1 FROM conversation WHERE user_id = ? AND role = 'user' AND lower(content) LIKE ? LIMIT 1",
-                            (str(user_id), f"%{a}%")).fetchone())
+    if _db.execute("SELECT 1 FROM conversation WHERE user_id = ? AND role = 'user' AND lower(content) LIKE ? LIMIT 1",
+                   (str(user_id), f"%{a}%")).fetchone():
+        return True
+    # Someone who emailed him, or whom he emailed: a real address from his own mail, not a guess.
+    try:
+        return bool(_db.execute("SELECT 1 FROM emails WHERE user_id = ? AND (lower(from_addr) = ? OR lower(to_addrs) LIKE ?) LIMIT 1",
+                                (str(user_id), a, f"%{a}%")).fetchone())
+    except sqlite3.OperationalError:
+        return False
 
 
 def emails_sent_today(user_id) -> int:
@@ -240,7 +247,7 @@ def card(a: Action) -> View:
             lines.append(fmt.sub_html(fmt.link(p["link"], "Event page")))
     else:
         lines.append(f"✉️ To: {esc(p.get('to_name') or '')} &lt;{esc(p['to_email'])}&gt;".replace("To:  &lt;", "To: &lt;"))
-        lines.append(f"<b>Subject:</b> {esc(p['subject'])}")
+        lines.append(f"<b>Subject:</b> {esc(p['subject'])}" + (" · <i>reply in thread</i>" if p.get("thread_id") else ""))
         lines.append("")
         lines.append(esc(p["body"]))
     buttons = [[(label, f"act:{op}:{a.id}") for label, op in k.ops]]
@@ -437,20 +444,30 @@ def _mime(a: Action) -> str:
     m = EmailMessage()
     m["To"] = f"{p.get('to_name')} <{p['to_email']}>" if p.get("to_name") else p["to_email"]
     m["Subject"] = p["subject"]
+    if p.get("in_reply_to"):  # a reply: keep it in the same thread
+        m["In-Reply-To"] = p["in_reply_to"]
+        m["References"] = " ".join(x for x in [p.get("references"), p["in_reply_to"]] if x)
     m.set_content(p["body"])
     return base64.urlsafe_b64encode(m.as_bytes()).decode()
 
 
+def _raw_body(a: Action) -> dict:
+    body = {"raw": _mime(a)}
+    if a.payload.get("thread_id"):
+        body["threadId"] = a.payload["thread_id"]
+    return body
+
+
 async def _do_draft(a: Action) -> dict:
     d = await asyncio.to_thread(lambda: gaccount.service("gmail", "v1").users().drafts().create(
-        userId="me", body={"message": {"raw": _mime(a)}}).execute())
+        userId="me", body={"message": _raw_body(a)}).execute())
     return {"draft_id": d["id"], "link": "https://mail.google.com/mail/u/0/#drafts",
             "confirm": f"Saved as a Gmail draft to {a.payload['to_email']}: \"{a.payload['subject']}\"."}
 
 
 async def _do_send(a: Action) -> dict:
     m = await asyncio.to_thread(lambda: gaccount.service("gmail", "v1").users().messages().send(
-        userId="me", body={"raw": _mime(a)}).execute())
+        userId="me", body=_raw_body(a)).execute())
     return {"message_id": m["id"], "link": f"https://mail.google.com/mail/u/0/#sent/{m['id']}",
             "confirm": f"Sent to {a.payload['to_email']}: \"{a.payload['subject']}\"."}
 
@@ -485,6 +502,16 @@ def save_contact_email(user_id, name: str, email: str) -> str:
     selfmodel.add_facts(user_id, [{"section": "people", "text": f"{name}", "attrs": {"name": name, "email": email.strip()}}],
                         "chat", stated=True)
     return f"Saved {email} for {name}."
+
+
+def save_contact_email_trusted(user_id, name: str, email: str) -> None:
+    """Save an address that came from his own mail (a sender or recipient), on the person's entry if known."""
+    data = selfmodel.get_profile(user_id)
+    for f in data["people"]:
+        if name and name.split()[0].lower() in f["text"].lower():
+            f.setdefault("attrs", {}).update(email=email.strip())
+            selfmodel.save_profile(user_id, data)
+            return
 
 
 def person_email(user_id, name: str) -> str | None:

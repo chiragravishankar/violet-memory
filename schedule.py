@@ -639,6 +639,22 @@ def add_event(user_id, it: Item, source: str) -> bool:
 FOLLOW_UP = re.compile(r"\b(follow[- ]?up|reach out|email|text|call|ping|reply to|get back to|send .* to)\b", re.I)
 
 
+def get_item(item_id: int) -> Item | None:
+    r = _db.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+    return _row_to_item(r) if r else None
+
+
+def update_due(item_id: int, d: date, t: time | None) -> None:
+    """Move an item to a new date/time (e.g. a deadline change announced by email) and re-plan reminders."""
+    _db.execute("UPDATE items SET due_date = ?, due_time = ? WHERE id = ?",
+                (d.isoformat(), t.strftime("%H:%M") if t else None, item_id))
+    _db.execute("DELETE FROM reminders WHERE item_id = ? AND sent = 0", (item_id,))
+    it = get_item(item_id)
+    if it:
+        _schedule_reminders(_db.execute("SELECT user_id FROM items WHERE id = ?", (item_id,)).fetchone()[0], it, datetime.now(TZ))
+    _db.commit()
+
+
 def mark_done_id(item_id: int) -> None:
     _db.execute("UPDATE items SET done = 1 WHERE id = ?", (item_id,))
     _db.execute("DELETE FROM reminders WHERE item_id = ? AND sent = 0", (item_id,))
@@ -742,7 +758,7 @@ EVENT_LEAD = ("1h", timedelta(hours=1))
 # Events he said "going" to from discovery (source "nyu_events", later "luma", ...): 1 day and 2 hours.
 RSVP_LEADS = [("1d", timedelta(days=1)), ("2h", timedelta(hours=2))]
 APPROVAL_LEAD = ("approval", timedelta(days=2))  # check the host approved his registration
-CALENDAR_SOURCES = {"file", "chat", "brightspace", "google"}
+CALENDAR_SOURCES = {"file", "chat", "brightspace", "google", "email"}
 STALE_AFTER = timedelta(hours=1)  # a reminder missed by more than this (bot was off) is dropped
 LEAD_WORDS = {
     "1w": "in 1 week", "3d": "in 3 days", "1d": "tomorrow", "3h": "in 3 hours",
