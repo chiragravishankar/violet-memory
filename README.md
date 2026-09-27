@@ -214,3 +214,19 @@ sqlite3 data/messages.db "select ts, direction, user_id, text from messages orde
 ## Reset all memories
 
 Stop the bot and delete the `data/` folder.
+
+## Memory backend: Cognee Cloud
+
+Memory lives in Cognee Cloud by default (`COGNEE_MODE=cloud`, with `COGNEE_SERVICE_URL` and
+`COGNEE_API_KEY` in `.env`). `brain.py` is the only module that touches Cognee. At startup it calls
+`cognee.serve()` on the bot's event loop.
+
+- **Writes** go into a `memory_outbox` table in `data/violet.db` and are sent with `remember()` in
+  the background, retried with backoff. A sleeping workspace never loses a memory or blocks a reply.
+- **Reads** use `recall()` and are time-boxed (about 8 to 10 seconds for replies). If memory doesn't
+  answer in time, Violet answers from the profile and schedule and says memory is catching up.
+- **Rollback:** set `COGNEE_MODE=local` (or `git checkout local-cognee`). The local Cognee data
+  under `data/` is untouched.
+- **Migration:** run `scripts/migrate_to_cloud.py`, with `--dry-run` first. Stop the bot before
+  running it.
+- **Checks:** `scripts/memory_check.py` runs a round trip and measures latency.

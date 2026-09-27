@@ -146,7 +146,7 @@ def is_schedule_question(question: str, about_schedule: bool, today) -> bool:
 
 
 async def _context(user_id, question: str, limit: int = 2500) -> str:
-    return (await brain.context_for(user_id, question))[:limit] or "nothing relevant"
+    return (await brain.context_for(user_id, question, wait=8))[:limit] or brain.fallback_note() or "nothing relevant"
 
 
 async def answer(user_id, question: str, about_schedule: bool, now: datetime | None = None,

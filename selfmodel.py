@@ -6,7 +6,6 @@ stated_or_inferred, confidence, first_seen, last_confirmed. Stored as JSON in SQ
 mirrored into the user's Cognee dataset as one "me" document tagged node_set=["core_profile"].
 """
 
-import hashlib
 import json
 import logging
 import re
@@ -16,8 +15,7 @@ from datetime import datetime, time, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
-import brain  # must come before cognee: it points Cognee's storage at data/
-import cognee  # noqa: E402
+import brain  # the only module that touches Cognee
 import llm
 from schedule import TZ
 
@@ -719,23 +717,7 @@ async def sync_to_memory(user_id, force: bool = False) -> bool:
     if not any(True for _ in facts(data)):
         return False
     doc = memory_document(user_id)
-    ds_name = brain.dataset_for(user_id)
-    old = data["_meta"].get("memory_data_id")
-    if old:
-        try:
-            ds = next(d for d in await cognee.datasets.list_datasets() if d.name == ds_name)
-            await cognee.datasets.delete_data(ds.id, uuid.UUID(old))
-        except Exception as e:
-            log.info("could not delete old profile document (%s)", type(e).__name__)
-    await cognee.add(doc, dataset_name=ds_name, node_set=CORE_NODE_SET)
-    brain._known.add(ds_name)
-    data_id = None
-    try:
-        ds = next(d for d in await cognee.datasets.list_datasets() if d.name == ds_name)
-        want = "text_" + hashlib.md5(doc.encode()).hexdigest()
-        data_id = next((str(d.id) for d in await cognee.datasets.list_data(ds.id) if d.name == want), None)
-    except Exception as e:
-        log.info("could not find profile document id (%s)", type(e).__name__)
+    data_id = await brain.replace_document(user_id, doc, data["_meta"].get("memory_data_id"), CORE_NODE_SET)
     data = get_profile(user_id)
     data["_meta"].update(memory_data_id=data_id, memory_dirty=False)
     save_profile(user_id, data, dirty=False)

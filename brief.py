@@ -146,7 +146,7 @@ async def _memory(user_id, e: Entry) -> str:
     q = (f"Who's in my {e.course or e.title} class or group, what's due next for it, and what did I note about it?"
          if e.kind == "class" else f"What do I know about {e.title}: who's involved, what I promised, what it's for?")
     try:
-        return (await asyncio.wait_for(brain.context_for(user_id, q), MEMORY_TIMEOUT))[:1200]
+        return (await brain.context_for(user_id, q, wait=MEMORY_TIMEOUT))[:1200]
     except (asyncio.TimeoutError, Exception) as ex:
         log.info("memory lookup skipped (%s)", type(ex).__name__)
         return ""

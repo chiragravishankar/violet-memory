@@ -652,7 +652,7 @@ async def draft_reply(user_id, email_id: str, nudge: bool = False) -> actions.Ac
         except Exception:
             pass
     try:
-        memory = (await asyncio.wait_for(brain.context_for(user_id, f"What do I know about {to_name or to_addr}?"), 6))[:800]
+        memory = (await brain.context_for(user_id, f"What do I know about {to_name or to_addr}?", wait=6))[:800]
     except Exception:
         memory = ""
     what = "a short, friendly follow-up nudge (he hasn't heard back)" if nudge else "a reply"

@@ -539,6 +539,7 @@ _buffers: dict[int, dict] = {}
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    brain.touch()  # start waking hosted memory while we work on the reply
     text = update.effective_message.text
     user_id = update.effective_user.id
     row = log_message("in", update, _FEED_URL.sub("<feed url>", text))
@@ -1090,6 +1091,7 @@ async def demo_time(user_id, at: datetime) -> list:
 
 
 async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    brain.touch()  # start waking hosted memory while we work on the reply
     msg = update.effective_message
     user_id = update.effective_user.id
     log_message("in", update, inbound_text(update))
@@ -1144,6 +1146,7 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Voice notes, audio files and video notes: transcribe, then handle exactly like typed text."""
+    brain.touch()  # start waking hosted memory while we work on the reply
     msg = update.effective_message
     media = msg.voice or msg.audio or msg.video_note
     user_id = update.effective_user.id
@@ -1375,6 +1378,7 @@ async def brief_loop(app: Application) -> None:
 
 
 async def post_init(app: Application) -> None:
+    await brain.start()  # Cognee Cloud: connect on this loop before any memory operation
     n = actions.expire_stale_sends()  # a send cut off by a restart never goes out late
     if n:
         log.warning("%d interrupted email send(s) marked failed", n)

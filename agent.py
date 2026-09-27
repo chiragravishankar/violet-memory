@@ -155,11 +155,8 @@ async def t_get_next_items(turn: Turn, n: int = 3, kinds: list[str] | None = Non
 
 
 async def t_search_memory(turn: Turn, query: str) -> dict:
-    try:
-        text = await asyncio.wait_for(brain.context_for(turn.user_id, query), 8)
-    except asyncio.TimeoutError:
-        text = ""
-    return {"found": text[:2500] or "nothing relevant"}
+    text = await brain.context_for(turn.user_id, query, wait=8)
+    return {"found": text[:2500] or brain.fallback_note() or "nothing relevant"}
 
 
 async def t_get_profile(turn: Turn) -> dict:
@@ -203,11 +200,8 @@ async def t_find_people(turn: Turn, query: str) -> dict:
     q = query.lower()
     people = [f["text"] for f in selfmodel.get_profile(turn.user_id)["people"]
               if not q or any(w in f["text"].lower() for w in re.findall(r"[a-z]+", q) if len(w) > 2)]
-    try:
-        mem = await asyncio.wait_for(brain.context_for(turn.user_id, f"Who is {query}? How do I know them?"), 8)
-    except asyncio.TimeoutError:
-        mem = ""
-    return {"from_profile": people, "from_memory": mem[:1500] or "nothing"}
+    mem = await brain.context_for(turn.user_id, f"Who is {query}? How do I know them?", wait=8)
+    return {"from_profile": people, "from_memory": mem[:1500] or brain.fallback_note() or "nothing"}
 
 
 async def t_get_followups(turn: Turn) -> dict:
