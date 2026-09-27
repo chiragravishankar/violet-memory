@@ -572,7 +572,10 @@ def log_view(user_id, n: int = 15) -> View:
     for r in rows:
         a = _row(r)
         when = datetime.fromisoformat(r["created_at"]).astimezone(TZ)
-        verb = {"email": {"send": "Sent", "draft": "Drafted"}.get(a.op or "", "Email")}.get(a.type, _TYPE_LABEL.get(a.type, a.type))
+        if a.type == "email" and a.status in ("done", "undone"):
+            verb = {"send": "Sent", "draft": "Drafted"}.get(a.op or "", "Email")
+        else:
+            verb = _TYPE_LABEL.get(a.type, a.type)
         head = f"{_STATUS_ICON.get(a.status, '•')} <b>{esc(verb)}</b> · {esc(fmt.short_title(a.summary, limit=50))}"
         detail = f"{when:%a %b} {when.day}, {fmt.fmt_time(when.time())} · {a.status}"
         lines.append(head)
