@@ -26,6 +26,7 @@ import docs
 import events
 import feeds
 import gaccount
+import inbox
 import ingest
 import onboarding
 import schedule
@@ -51,6 +52,7 @@ COMMANDS = (
     "/forget <text>  make me forget something\n"
     "/connect_google  let me add calendar events and write emails (always with your OK)\n"
     "/actions  what I've done or offered to do\n"
+    "/inbox  email that needs you (/email alerts on|off, /email quiet)\n"
     "/settings calendar auto|ask  add calendar events without asking, or ask first\n"
     "/demo_time 2026-09-29 13:30  preview reminders at a moment"
 )
@@ -381,6 +383,27 @@ async def connect_google_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await reply(update, f"Connected to Google as {email}. I'll always show you a card before adding events or sending anything.")
 
 
+async def inbox_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log_message("in", update, inbound_text(update))
+    await send_view(context.bot, update.effective_chat.id, inbox.inbox_view(update.effective_user.id))
+
+
+async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/email alerts on|off, /email quiet (brief only)"""
+    log_message("in", update, inbound_text(update))
+    user_id = update.effective_user.id
+    args = [a.lower() for a in context.args]
+    if args[:1] == ["quiet"]:
+        inbox.set_alerts(user_id, "quiet")
+        await reply(update, "Okay, no instant email alerts. I'll keep important mail for your morning brief.")
+    elif len(args) == 2 and args[0] == "alerts" and args[1] in ("on", "off"):
+        inbox.set_alerts(user_id, args[1])
+        await reply(update, "Email alerts on. Only the important ones, at most 5 a day." if args[1] == "on"
+                    else "Email alerts off. /inbox still shows what needs you.")
+    else:
+        await reply(update, f"Email alerts: {inbox.settings(user_id)['alerts']}. Use /email alerts on, /email alerts off or /email quiet.")
+
+
 async def actions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
     await send_view(context.bot, update.effective_chat.id, actions.log_view(update.effective_user.id))
@@ -657,6 +680,46 @@ def _add_env_list(key: str, value: str) -> None:
     os.environ[key] = merged
 
 
+async def _email_button(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id, op: str, ref: str) -> None:
+    chat_id = update.effective_chat.id
+    if op in ("reply", "nudge"):
+        try:
+            a = await _with_typing(update, context, inbox.draft_reply(user_id, ref, nudge=op == "nudge"))
+        except actions.Refused as r:
+            await reply(update, str(r))
+            return
+        except Exception as e:
+            log.warning("draft reply failed (%s)", type(e).__name__)
+            await reply(update, "Couldn't write that draft right now. Try again in a moment?")
+            return
+        await offer_card(context.bot, chat_id, user_id, a.id)
+    elif op == "sched":
+        e = inbox.get_email(ref)
+        if e is None:
+            await reply(update, "I can't find that email anymore.")
+            return
+        told, new_ids = inbox.apply_items(user_id, e)
+        await reply(update, "Updated your schedule:\n" + "\n".join(f"• {t}" for t in told) if told
+                    else "That's already on your schedule.")
+        for item_id in new_ids[:3]:
+            it = schedule.get_item(item_id)
+            if it:
+                try:
+                    a = actions.propose(user_id, "calendar_add", actions.calendar_from_item(it), it.title, "email")
+                    await offer_card(context.bot, chat_id, user_id, a.id)
+                except actions.Refused:
+                    pass
+    elif op == "ok":
+        await reply(update, "👍")
+    elif op in ("snooze1", "wait3"):
+        kind = "dropped" if op == "snooze1" else "waiting"
+        inbox.set_nudge(user_id, ref, kind, "snoozed", snooze=timedelta(days=1 if op == "snooze1" else 3))
+        await reply(update, "I'll bring it up again tomorrow." if op == "snooze1" else "I'll check again in 3 days.")
+    elif op in ("noreply", "letgo"):
+        inbox.set_nudge(user_id, ref, "dropped" if op == "noreply" else "waiting", "dismissed")
+        await reply(update, "Got it, I'll leave that thread alone.")
+
+
 async def _propose_going(bot, chat_id: int, user_id, e) -> None:
     try:
         a = actions.propose(user_id, "calendar_add", actions.calendar_from_event(e), e.title, "going")
@@ -679,6 +742,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Toggling inside /week edits the message; "Full week" from the brief sends a new one.
         await send_view(context.bot, update.effective_chat.id, v,
                         edit_message=None if len(parts) > 2 else q.message)
+    elif data == "inbox":
+        await send_view(context.bot, update.effective_chat.id, inbox.inbox_view(user_id))
     elif data == "events":
         await send_view(context.bot, update.effective_chat.id, _events_view(user_id, False, now))
     elif data.startswith("ev:"):
@@ -704,6 +769,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await reply(update, "What should I change? Tell me in plain words (a different time, a shorter email...).")
             return
         await act_on_card(context.bot, update.effective_chat.id, user_id, action_id, op, "button", q.message)
+    elif data.startswith("em:"):
+        _, op, ref = data.split(":", 2)
+        await _email_button(update, context, user_id, op, ref)
     elif data.startswith("draft:"):
         it = next((i for i in schedule.existing_items(user_id) if str(i.id) == data[6:]), None)
         if it is None:
@@ -1054,6 +1122,76 @@ async def profile_loop(app: Application) -> None:
                     log.warning("weekly reflection failed (%s)", type(e).__name__)
 
 
+async def email_loop(app: Application) -> None:
+    """Every 10 minutes: new mail since last time (read-only). Then schedule updates from email,
+    important alerts (max 5 a day, held in quiet hours) and, hourly, dropped-thread and waiting-on nudges."""
+    told_reconnect, last_nudges = set(), None
+    while True:
+        now = datetime.now(schedule.TZ)
+        for user_id in event_users():
+            try:
+                if not gaccount.connected():
+                    continue
+                if not gaccount.can_read_mail():
+                    if user_id not in told_reconnect:
+                        log.info("email awareness needs read access: /connect_google again")
+                        told_reconnect.add(user_id)
+                    continue
+                if inbox.due(user_id):
+                    started = datetime.now(timezone.utc).isoformat()
+                    rep = await inbox.sync(user_id)
+                    if rep.first and not rep.error:
+                        await send_view(app.bot, int(user_id), View(
+                            f"📬 <b>INBOX CONNECTED</b>\n↳ Read the last {inbox.FIRST_SYNC_DAYS} days: {rep.fetched} emails, "
+                            f"{rep.skipped} skipped (promotions, social, newsletters), {rep.classified} sorted.\n"
+                            "↳ I only read. I never delete, archive or mark anything, and I never send without your OK.",
+                            [[("📬 Open inbox", "inbox")]]))
+                    await _after_sync(app, user_id, started, first=rep.first)
+                quiet = selfmodel.quiet_until(user_id, now)
+                if inbox.settings(user_id)["alerts"] == "on" and not quiet:
+                    for e in inbox.pending_alerts(user_id):
+                        await send_view(app.bot, int(user_id), inbox.alert_view(e))
+                        inbox.mark_alerted(e.id)
+                if (last_nudges is None or now - last_nudges >= timedelta(hours=1)) and not quiet:
+                    for n in inbox.nudges_due(user_id)[:2]:
+                        await send_view(app.bot, int(user_id), inbox.nudge_view(n))
+                        inbox.set_nudge(user_id, n["email"].thread_id if n["kind"] == "dropped" else n["thread_id"], n["kind"], "sent",
+                                        email_id=n["email"].id if n["kind"] == "dropped" else n["id"])
+            except Exception:
+                log.exception("email loop error")
+        if last_nudges is None or now - last_nudges >= timedelta(hours=1):
+            last_nudges = now
+        await asyncio.sleep(60)
+
+
+async def _after_sync(app: Application, user_id, since: str, first: bool) -> None:
+    """New mail: deadlines and changes onto the schedule (telling him), calendar cards for new ones,
+    and important facts into memory."""
+    rows = inbox._db.execute("SELECT id FROM emails WHERE user_id = ? AND classified_at >= ? AND mine = 0", (str(user_id), since)).fetchall()
+    told_all, cards = [], 0
+    for r in rows:
+        e = inbox.get_email(r["id"])
+        if e is None:
+            continue
+        inbox.remember_important(user_id, e)
+        if e.items and not e.applied and (datetime.now(timezone.utc) - e.date) < timedelta(days=inbox.FIRST_SYNC_DAYS):
+            told, new_ids = inbox.apply_items(user_id, e)
+            told_all += told
+            for item_id in new_ids:
+                it = schedule.get_item(item_id)
+                if it and cards < 3 and it.due_date and it.due_date >= datetime.now(schedule.TZ).date():
+                    try:
+                        a = actions.propose(user_id, "calendar_add", actions.calendar_from_item(it), it.title, "email")
+                        cards += 1
+                        await offer_card(app.bot, int(user_id), user_id, a.id)
+                    except actions.Refused:
+                        pass
+    if told_all:
+        await send_view(app.bot, int(user_id), fmt.view("📅 <b>FROM YOUR EMAIL</b>\n" + "\n".join(f"• {fmt.esc(t)}" for t in told_all[:8])))
+    if rows:
+        app.create_task(brain.connect(user_id))
+
+
 def event_users() -> list[str]:
     ids = {feeds.calendar_user()} | {u for u in selfmodel.all_user_ids() if u.isdigit()}
     return sorted(u for u in ids if u)
@@ -1115,6 +1253,7 @@ async def post_init(app: Application) -> None:
     app.create_task(profile_loop(app))
     app.create_task(events_loop(app))
     app.create_task(brief_loop(app))
+    app.create_task(email_loop(app))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1144,6 +1283,8 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("brief", brief_cmd))
     app.add_handler(CommandHandler("connect_google", connect_google_cmd))
     app.add_handler(CommandHandler("actions", actions_cmd))
+    app.add_handler(CommandHandler("inbox", inbox_cmd))
+    app.add_handler(CommandHandler("email", email_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_file))

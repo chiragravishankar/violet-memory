@@ -133,6 +133,20 @@ previews what would fire at that moment.
   `/settings calendar auto` adds those without asking (still logged). `/actions` shows the last 15.
 - Events Violet adds to Google Calendar are skipped by the Google Calendar feed import.
 
+## Email awareness (read-only)
+
+- `inbox.py` with the gmail.readonly scope (older grants: send /connect_google again). First run reads
+  14 days of inbox and sent mail, then only new mail every 10 minutes (Gmail history, date query as
+  fallback). Skips promotions, social, spam, trash and newsletters unless NYU or someone you know.
+  Stores metadata, a snippet, a one-line summary and extracted dates, never full bodies; only
+  important facts go to memory. Never deletes, archives, labels or marks anything.
+- Emails are untrusted: the model that reads them has no tools, dates are kept only if the email
+  states them, and replies are written by a separate tool-free call and proposed as cards.
+- Alerts (importance 80+, max 5 a day, held in quiet hours) with [📅 Update schedule] [✍️ Draft reply]
+  [👍 Got it]. Deadlines and changes go on the schedule (a change moves the existing item) with
+  Google Calendar cards. Nudges for threads waiting on you (48 h) and for no reply to you (5 days).
+- /inbox, /email alerts on|off, /email quiet; the agent can search_email; 📬 in the brief.
+
 ## Formatting and the daily brief
 
 - `fmt.py`: the one formatter (Telegram HTML). Section headers "📅 <b>TODAY</b>", bold times

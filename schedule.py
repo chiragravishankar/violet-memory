@@ -321,7 +321,7 @@ def _validate(raw: dict, chunk: str, relative_today: date | None = None) -> list
 
 # ---------- Dedupe ----------
 
-_STOP = {"the", "a", "an", "of", "for", "and", "due", "submission", "submit"}
+_STOP = {"the", "a", "an", "of", "for", "and", "due", "submission", "submit", "deadline", "date"}
 
 
 def _norm_title(title: str, course: str = "") -> str:

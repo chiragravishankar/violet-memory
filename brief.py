@@ -235,11 +235,15 @@ async def daily(user_id, day: date, now: datetime | None = None) -> View:
     exam_lines = [views.deadline_bullet(e, today, compact=True)[0] for e in d.exams]
     fu_lines = [fmt.bullet(f"{esc(fmt.short_title(e.title))} · <b>{esc(e.time_text)}</b>", "person") for e in d.follow_ups]
     pick_lines = views.event_lines(d.pick, today) if d.pick else []
+    import inbox
+
+    inbox_lines = inbox.brief_lines(user_id) if day == datetime.now(TZ).date() else []
 
     if total <= LIGHT_MAX:
         # Light day: greeting, the one or two items, the tip.
         body = agenda_lines + due_lines + exam_lines + fu_lines + pick_lines
-        text = fmt.join(f"{greet}\n{sub_head}", "\n".join(body) if body else "Nothing on your calendar today.", tip)
+        text = fmt.join(f"{greet}\n{sub_head}", "\n".join(body) if body else "Nothing on your calendar today.",
+                        fmt.section("📬 <b>INBOX</b>", inbox_lines), tip)
     else:
         text = fmt.join(
             f"{greet}\n{sub_head}",
@@ -247,6 +251,7 @@ async def daily(user_id, day: date, now: datetime | None = None) -> View:
             fmt.section(fmt.header("deadline", "Due soon"), due_lines),
             fmt.section(fmt.header("exam", "Exams this week"), exam_lines),
             fmt.section(fmt.header("person", "Follow ups"), fu_lines),
+            fmt.section("📬 <b>INBOX</b>", inbox_lines),
             fmt.section(fmt.header("event", "Worth your time"), pick_lines),
             tip,
         )

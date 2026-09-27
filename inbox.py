@@ -133,17 +133,31 @@ def _known_people(user_id) -> list[dict]:
         a = f.get("attrs", {})
         name = a.get("name") or f["text"].split(":")[0]
         out.append({"name": name, "email": (a.get("email") or "").lower(), "text": f["text"]})
+        _PROFS[name] = bool(re.search(r"\bprof(essor)?\b", f["text"], re.I))
     return out
 
 
 def _match_person(user_id, addr: str, name: str) -> str | None:
+    """A known person by address, or by name ("David Jacoby" matches "Professor David Steven Jacoby")."""
     addr = (addr or "").lower()
+    words = [w for w in re.findall(r"[a-z]+", (name or "").lower()) if len(w) > 1]
     for p in _known_people(user_id):
         if p["email"] and p["email"] == addr:
             return p["name"]
-        if name and p["name"] and p["name"].lower() == name.lower():
+        pw = set(re.findall(r"[a-z]+", (p["name"] or "").lower()))
+        if len(words) >= 2 and all(w in pw for w in words):
             return p["name"]
     return None
+
+
+_PROFS: dict[str, bool] = {}  # person name -> is a professor (from the profile text)
+
+
+def display_name(person: str | None, fallback: str) -> str:
+    """"Professor David Steven Jacoby" (or a profile entry saying so) -> "Prof. Jacoby"."""
+    if person and (re.match(r"^(prof(essor)?\.?)\s", person, re.I) or _PROFS.get(person)):
+        return f"Prof. {person.split()[-1]}"
+    return person or fallback
 
 
 def _fetch_blocking(user_id, ids: list[str], me: str) -> tuple[list[dict], int]:
@@ -261,11 +275,16 @@ def _courses(user_id) -> str:
     return "; ".join(courses) + (" | " + "; ".join(profs) if profs else "")
 
 
+def _norm(t: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", t.lower()))
+
+
 def _valid_items(items, text: str) -> list[dict]:
     out = []
+    body = _norm(text)
     for it in items or []:
-        ev = re.sub(r"\s+", " ", str(it.get("evidence") or "")).strip().lower()
-        if not ev or ev not in re.sub(r"\s+", " ", text).lower():
+        ev = _norm(str(it.get("evidence") or ""))
+        if not ev or ev not in body:
             continue  # the date must be written in the email itself
         if it.get("date"):
             try:
@@ -298,19 +317,29 @@ async def classify(user_id, todo: list[dict]) -> int:
             e = by_id.get(str(r.get("id")))
             if not e:
                 continue
-            row = _db.execute("SELECT from_addr, from_name FROM emails WHERE id = ?", (e["id"],)).fetchone()
+            row = _db.execute("SELECT from_addr, from_name, to_addrs FROM emails WHERE id = ?", (e["id"],)).fetchone()
             person = _match_person(user_id, row["from_addr"], row["from_name"])
+            imp = _importance(r.get("importance"))
+            if person:  # newsletters never get this far, so this is a direct email from someone he knows
+                imp = max(imp, ALERT_MIN)
             _db.execute(
                 "UPDATE emails SET category=?, importance=?, summary=?, needs_reply=?, items=?, course=?, person=?, classified_at=? WHERE id=?",
-                (str(r.get("category") or "other"), max(0, min(100, int(r.get("importance") or 0))),
+                (str(r.get("category") or "other"), imp,
                  fmt.nodash(str(r.get("summary") or ""))[:200], int(bool(r.get("needs_reply"))),
                  json.dumps(_valid_items(r.get("items"), f"{e['subject']} {e['text']}")),
                  str(r.get("course") or ""), person, _now().isoformat(), e["id"]))
+            _db.commit()  # before touching the profile: it's a separate connection to the same file
             done += 1
             if person:
                 _touch_person(user_id, person, row["from_addr"])
-        _db.commit()
     return done
+
+
+def _importance(v) -> int:
+    try:
+        return max(0, min(100, int(float(v))))
+    except (TypeError, ValueError):
+        return {"high": 85, "medium": 55, "low": 20}.get(str(v).lower(), 30)
 
 
 def _touch_person(user_id, name: str, addr: str) -> None:
@@ -391,7 +420,7 @@ class Email:
 
     @property
     def who(self) -> str:
-        return self.person or self.from_name or self.from_addr
+        return display_name(self.person, self.from_name or self.from_addr)
 
 
 def _email(r) -> Email:
