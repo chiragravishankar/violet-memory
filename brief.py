@@ -220,6 +220,11 @@ async def daily(user_id, day: date, now: datetime | None = None) -> View:
     today = day
     greet = f"☀️ Good morning, {esc(d.name)}"
     sub_head = f"{esc(f'{day:%A}, {day:%b} {day.day}')} · {esc(lines['tone'])}"
+    import actions
+
+    did = actions.done_yesterday(user_id) if day == datetime.now(TZ).date() else 0
+    if did:
+        sub_head += f"\n✅ Yesterday I did {did} thing{'s' if did != 1 else ''} for you · /actions"
     tip = f"💡 {esc(lines['tip'])}" if lines["tip"] else None
     total = len(d.agenda) + len(d.due_soon) + len(d.exams) + len(d.follow_ups) + (1 if d.pick else 0)
 

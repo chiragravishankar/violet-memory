@@ -17,6 +17,7 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+import actions
 import agent
 import assistant
 import brain  # loads .env
@@ -24,6 +25,7 @@ import brief
 import docs
 import events
 import feeds
+import gaccount
 import ingest
 import onboarding
 import schedule
@@ -47,6 +49,9 @@ COMMANDS = (
     "/undo  remove what your last file added\n"
     "/me  what I know about you (/me setup, /me edit, /me reflect)\n"
     "/forget <text>  make me forget something\n"
+    "/connect_google  let me add calendar events and write emails (always with your OK)\n"
+    "/actions  what I've done or offered to do\n"
+    "/settings calendar auto|ask  add calendar events without asking, or ask first\n"
     "/demo_time 2026-09-29 13:30  preview reminders at a moment"
 )
 FILES_DIR = Path(__file__).resolve().parent / "data" / "files"
@@ -121,18 +126,28 @@ def recent_replies(user_id, n: int = 5) -> list[str]:
     return [r[0] for r in reversed(rows) if r[0]]
 
 
+_last_out: dict[int, int] = {}  # chat id -> id of the last message the bot sent there
+
+
+def _track(chat_id: int, msg) -> None:
+    if msg is not None and getattr(msg, "message_id", None):
+        _last_out[chat_id] = msg.message_id
+
+
 async def reply(update: Update, text: str) -> None:
     """Send text that is already in Violet's voice."""
     note = _take_voice_note()
     if note is None:
-        await update.effective_message.reply_text(text)
+        _track(update.effective_chat.id, await update.effective_message.reply_text(text))
     else:
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("📝 Full transcript", callback_data=f"tr:{note['token']}")]])
         try:
-            await update.effective_message.reply_text(f"{note['quote']}\n\n{fmt.esc(text)}", parse_mode=ParseMode.HTML,
-                                                      reply_markup=markup, disable_web_page_preview=True)
+            _track(update.effective_chat.id, await update.effective_message.reply_text(
+                f"{note['quote']}\n\n{fmt.esc(text)}", parse_mode=ParseMode.HTML, reply_markup=markup,
+                disable_web_page_preview=True))
         except BadRequest:
-            await update.effective_message.reply_text(f"{fmt.to_plain(note['quote'])}\n\n{text}", reply_markup=markup)
+            _track(update.effective_chat.id, await update.effective_message.reply_text(
+                f"{fmt.to_plain(note['quote'])}\n\n{text}", reply_markup=markup))
     log_message("out", update, text)
 
 
@@ -148,7 +163,7 @@ def _markup(v: View) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-async def send_view(bot, chat_id: int, v: View, edit_message=None) -> None:
+async def send_view(bot, chat_id: int, v: View, edit_message=None):
     """Send (or edit) a structured view as HTML; if Telegram rejects the formatting, resend plain."""
     note = _take_voice_note() if edit_message is None else None
     if note is not None:
@@ -159,14 +174,87 @@ async def send_view(bot, chat_id: int, v: View, edit_message=None) -> None:
             await edit_message.edit_text(v.html, parse_mode=ParseMode.HTML, reply_markup=markup,
                                          disable_web_page_preview=True)
         else:
-            await bot.send_message(chat_id, v.html, parse_mode=ParseMode.HTML, reply_markup=markup,
-                                   disable_web_page_preview=True)
+            msg = await bot.send_message(chat_id, v.html, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                         disable_web_page_preview=True)
+            _track(chat_id, msg)
+            log_raw("out", chat_id, chat_id, v.plain)
+            return msg
     except BadRequest as e:
         if "not modified" in str(e).lower():
             return
         log.warning("HTML send failed (%s), sending plain text", e)
-        await bot.send_message(chat_id, v.plain, reply_markup=markup, disable_web_page_preview=True)
+        msg = await bot.send_message(chat_id, v.plain, reply_markup=markup, disable_web_page_preview=True)
+        _track(chat_id, msg)
+        log_raw("out", chat_id, chat_id, v.plain)
+        return msg
     log_raw("out", chat_id, chat_id, v.plain)
+    return None
+
+
+# ---------- Actions: cards, approvals, undo ----------
+
+
+async def offer_card(bot, chat_id: int, user_id, action_id: str) -> None:
+    """Show an action card, or run it straight away for a calendar add in "calendar auto" mode."""
+    a = actions.get(action_id)
+    if a is None:
+        return
+    if a.type == "calendar_add" and actions.calendar_mode(user_id) == "auto" and gaccount.connected():
+        await _send_outcome(bot, chat_id, a.id, await actions.approve(user_id, a.id, "do", "setting"))
+        return
+    msg = await send_view(bot, chat_id, actions.card(a))
+    if msg is not None:
+        actions.set_card_message(a.id, msg.message_id)
+
+
+async def _send_outcome(bot, chat_id: int, action_id: str, o) -> None:
+    text = fmt.esc(o.text) + (f" {fmt.link(o.link, 'Open')}" if o.link else "")
+    buttons = [[("↩️ Undo", f"act:undo:{action_id}")]] if o.undo else []
+    await send_view(bot, chat_id, View(text, buttons))
+    if o.sending:
+        asyncio.get_running_loop().create_task(_send_after_delay(bot, chat_id, action_id))
+
+
+async def _send_after_delay(bot, chat_id: int, action_id: str) -> None:
+    """The Undo window: the email leaves only if nobody tapped Undo in the meantime."""
+    await asyncio.sleep(actions.SEND_DELAY)
+    o = await actions.finish_send(action_id)
+    if o is not None:
+        await _send_outcome(bot, chat_id, action_id, o)
+
+
+async def act_on_card(bot, chat_id: int, user_id, action_id: str, op: str, via: str, card_message=None) -> None:
+    """His decision on a card: do / send / draft / cancel / undo."""
+    if op == "undo":
+        o = await actions.undo(user_id, action_id)
+        await _send_outcome(bot, chat_id, action_id, o)
+        return
+    o = await actions.approve(user_id, action_id, op, via)
+    if card_message is not None and op in ("do", "send", "draft", "cancel"):
+        a = actions.get(action_id)
+        if a and a.status not in ("pending",):
+            try:
+                await card_message.edit_reply_markup(reply_markup=None)  # the card is decided: no more buttons
+            except Exception:
+                pass
+    await _send_outcome(bot, chat_id, action_id, o)
+
+
+_YES = re.compile(r"^\s*(yes|yeah|yep|yup|ok|okay|sure|do it|go ahead|add it|please do|sounds good)\b", re.I)
+_SEND = re.compile(r"\b(send it|send now|yes,? send|go ahead and send|send)\b", re.I)
+_DRAFT = re.compile(r"\b(draft|save it|save as)\b", re.I)
+_NO = re.compile(r"^\s*(no|nope|cancel|don'?t|stop|never ?mind|nah)\b", re.I)
+
+
+def _card_being_answered(update: Update, user_id):
+    """The pending card this text answers: a Telegram reply to the card, or the card being the last
+    thing sent in the chat. Anything else is not an approval."""
+    replied = getattr(update.effective_message, "reply_to_message", None)
+    target = replied.message_id if replied is not None else _last_out.get(update.effective_chat.id)
+    for a in actions.pending_for(user_id):
+        if a.card_message_id and a.card_message_id == target:
+            return a
+    return None
 
 
 async def reply_any(update: Update, context: ContextTypes.DEFAULT_TYPE, answer) -> None:
@@ -276,6 +364,42 @@ async def _deliver_brief(bot, user_id, day, v: View) -> None:
         events.remember_list(user_id, [pick.event.id])
 
 
+async def connect_google_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run Google's sign-in in the browser on this computer and save the token."""
+    log_message("in", update, inbound_text(update))
+    if not gaccount.CLIENT_FILE.exists():
+        await reply(update, "credentials.json is missing from the project, so I can't start the Google login.")
+        return
+    await reply(update, "Opening Google sign-in in your browser on this computer. Allow Calendar and Gmail, then come back here.")
+    try:
+        email = await gaccount.login()
+    except Exception as e:
+        log.warning("google login failed (%s)", type(e).__name__)
+        await reply(update, "Couldn't finish the Google login. If Google said \"access blocked\", use a personal Gmail "
+                            "that's added as a test user on the app's consent screen, then send /connect_google again.")
+        return
+    await reply(update, f"Connected to Google as {email}. I'll always show you a card before adding events or sending anything.")
+
+
+async def actions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log_message("in", update, inbound_text(update))
+    await send_view(context.bot, update.effective_chat.id, actions.log_view(update.effective_user.id))
+
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/settings calendar auto|ask"""
+    log_message("in", update, inbound_text(update))
+    user_id = update.effective_user.id
+    args = [a.lower() for a in context.args]
+    if len(args) == 2 and args[0] == "calendar" and args[1] in ("auto", "ask"):
+        actions.set_calendar_mode(user_id, args[1])
+        await reply(update, "Got it. I'll add low-risk calendar events without asking (they still show up in /actions)."
+                    if args[1] == "auto" else "Got it. I'll ask before adding anything to your calendar.")
+        return
+    mode = actions.calendar_mode(user_id)
+    await reply(update, f"Calendar adds: {mode}. Change it with /settings calendar auto or /settings calendar ask.")
+
+
 async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
     undone = schedule.undo_last_file(update.effective_user.id)
@@ -351,6 +475,40 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
         await _event_reply(update, context, user_id, text, *action)
         return
 
+    # A card being edited, or a reply to the card that was just shown.
+    editing = selfmodel.meta(user_id).get("awaiting_action_edit")
+    if editing:
+        selfmodel.set_meta(user_id, awaiting_action_edit=None)
+        set_classification(rows, "action_edit")
+        try:
+            a = await _with_typing(update, context, actions.edit(user_id, editing, text))
+        except actions.Refused as r:
+            await reply(update, str(r))
+            return
+        await speak(update, "Updated the card. Here it is again.", kind="confirmation", user_message=text)
+        await offer_card(context.bot, update.effective_chat.id, user_id, a.id)
+        return
+    card = _card_being_answered(update, user_id)
+    if card is not None:
+        op = None
+        if _NO.match(text):
+            op = "cancel"
+        elif card.type == "calendar_add" and (_YES.match(text) or _SEND.search(text)):
+            op = "do"
+        elif card.type == "email" and _DRAFT.search(text):
+            op = "draft"
+        elif card.type == "email" and _SEND.search(text):
+            op = "send"
+        elif card.type == "email" and _YES.match(text):
+            await reply(update, "Send it now, or save it as a draft? (Reply \"send\" or \"draft\", or tap a button.)")
+            _track(update.effective_chat.id, None)
+            _last_out[update.effective_chat.id] = card.card_message_id  # keep the card as the one being answered
+            return
+        if op:
+            set_classification(rows, f"action_{op}")
+            await act_on_card(context.bot, update.effective_chat.id, user_id, card.id, op, "text")
+            return
+
     # "I am Chirag Ravishankar": set the name in code, no model involved.
     m_name = assistant._NAME.match(text)
     if m_name and assistant._looks_like_name(m_name.group(1)):
@@ -395,6 +553,8 @@ async def _send_agent_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await send_view(context.bot, chat_id, View(_linkify(r.text or "Here you go."), buttons))
     else:
         await reply(update, r.text or "Hmm, I lost my train of thought there. Say that again?")
+    for action_id in r.cards:
+        await offer_card(context.bot, chat_id, update.effective_user.id, action_id)
 
 
 _URL = re.compile(r"https?://[^\s<>()]+[^\s<>().,!?;:'\"]")
@@ -423,6 +583,9 @@ async def _event_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     if action == "going":
         context.application.create_task(brain.connect(user_id))
     await speak(update, " ".join(drafts), kind="confirmation", user_message=text)
+    if action == "going":
+        for e in chosen:
+            await _propose_going(context.bot, update.effective_chat.id, user_id, e)
     agent.remember_turn(user_id, "user", text)
     agent.remember_turn(user_id, "assistant", last_reply(user_id) or " ".join(drafts))
 
@@ -494,6 +657,14 @@ def _add_env_list(key: str, value: str) -> None:
     os.environ[key] = merged
 
 
+async def _propose_going(bot, chat_id: int, user_id, e) -> None:
+    try:
+        a = actions.propose(user_id, "calendar_add", actions.calendar_from_event(e), e.title, "going")
+    except actions.Refused:
+        return
+    await offer_card(bot, chat_id, user_id, a.id)
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Tap buttons: week toggle, events, going / later / not for me, show more."""
     q = update.callback_query
@@ -520,6 +691,27 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if action == "going":
             context.application.create_task(brain.connect(user_id))
         await speak(update, draft, kind="confirmation", user_message=f"(tapped {action} on {e.title})")
+        if action == "going":
+            await _propose_going(context.bot, update.effective_chat.id, user_id, e)
+    elif data.startswith("act:"):
+        _, op, action_id = data.split(":", 2)
+        if op == "edit":
+            a = actions.get(action_id)
+            if a is None or a.status != "pending":
+                await reply(update, "That card isn't open anymore.")
+                return
+            selfmodel.set_meta(user_id, awaiting_action_edit=action_id)
+            await reply(update, "What should I change? Tell me in plain words (a different time, a shorter email...).")
+            return
+        await act_on_card(context.bot, update.effective_chat.id, user_id, action_id, op, "button", q.message)
+    elif data.startswith("draft:"):
+        it = next((i for i in schedule.existing_items(user_id) if str(i.id) == data[6:]), None)
+        if it is None:
+            await reply(update, "I can't find that follow-up anymore.")
+            return
+        r = await agent.respond(user_id, f"Draft an email for my follow-up \"{it.title}\" ({schedule.fmt_due(it)}). "
+                                         "Use what you know about the person. If you don't have their email address, ask me for it.")
+        await _send_agent_reply(update, context, r)
     elif data.startswith("tr:"):
         row = _db.execute("SELECT text FROM voice_transcripts WHERE token = ?", (data[3:],)).fetchone()
         text = f"📝 <b>TRANSCRIPT</b>\n\n<i>{fmt.esc(row[0])}</i>" if row else "That transcript isn't around anymore."
@@ -914,6 +1106,9 @@ async def brief_loop(app: Application) -> None:
 
 
 async def post_init(app: Application) -> None:
+    n = actions.expire_stale_sends()  # a send cut off by a restart never goes out late
+    if n:
+        log.warning("%d interrupted email send(s) marked failed", n)
     schedule.plan_all_reminders()
     app.create_task(send_reminders(app))
     app.create_task(sync_feeds(app))
@@ -947,6 +1142,9 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("events", events_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
     app.add_handler(CommandHandler("brief", brief_cmd))
+    app.add_handler(CommandHandler("connect_google", connect_google_cmd))
+    app.add_handler(CommandHandler("actions", actions_cmd))
+    app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

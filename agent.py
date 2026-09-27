@@ -421,7 +421,8 @@ How you work (you have tools; use them, don't guess about his calendar, people o
   "fun" means social things, hackathons, mixers and parties, not career panels.
 - Actions (Google Calendar events, emails): you can only PROPOSE them with propose_action; a card with
   buttons goes to him and nothing happens until he taps it or replies "yes" to that card. Never say
-  you added, sent or scheduled anything; say what the card is for ("Here's the card, tap Do it").
+  you added, sent or scheduled anything, and don't say "done" about a card. Calendar cards have Do it;
+  email cards have Send and Save as draft ("Here's the email, tap Send or Save as draft").
   When he asks to put something on his calendar, propose calendar_add. When he asks you to email or
   message someone, write the email and propose it. Adding a deadline or tapping going already makes a
   calendar card for you. Never guess or invent an email address: use one he gave (save it with
@@ -458,6 +459,8 @@ async def respond(user_id, text: str, now: datetime | None = None) -> Reply:
               + f"\nRight now it is {now:%A, %B} {now.day}, {now.year}, {fmt.fmt_time(now.time())} in New York "
                 f"(tomorrow is {(now + timedelta(days=1)):%A %b} {(now + timedelta(days=1)).day}).")
     messages = [{"role": "system", "content": system}] + history(user_id) + [{"role": "user", "content": text}]
+    # Record his message before any tool runs: an address he types in this very message counts as given.
+    remember_turn(user_id, "user", text)
     model = CHAT_MODEL
     final = ""
     for _ in range(MAX_ROUNDS):
@@ -495,7 +498,6 @@ async def respond(user_id, text: str, now: datetime | None = None) -> Reply:
     if not heart_ok:
         final = final.replace("💜", "")
     final = voice.vary_opener(voice.polish(final, budget), recent)
-    remember_turn(user_id, "user", text)
     shown = final + "".join(f"\n[showed: {v.plain[:400]}]" for v in turn.views)
     remember_turn(user_id, "assistant", shown.strip() or "(sent a view)")
     return Reply(final, turn.views, turn.buttons, turn.connect, turn.tools_used, turn.cards)

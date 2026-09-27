@@ -121,6 +121,18 @@ previews what would fire at that moment.
 - Calendar titles are cleaned once by the fast model and cached (`display_title`); the original
   title is kept for matching.
 
+## Actions (Google Calendar, Gmail)
+
+- `/connect_google` runs Google's sign-in in the browser on this computer (calendar.events,
+  gmail.compose, gmail.send) and saves `token.json` (owner-only, git-ignored, refreshed automatically).
+- The agent can only propose: `actions.py` stores a pending card; nothing runs until you tap it or
+  reply "yes" to that card. Cards expire after 24 hours and run at most once. [✏️ Edit] takes a plain-
+  language change. After running: a link and [↩️ Undo] (calendar events Violet created, drafts).
+- Emails: only to addresses you gave, in your style, [📤 Send] waits 10 seconds with Undo, at most 10 a
+  day, never coursework. Tapping Going or adding a deadline by chat proposes a calendar card;
+  `/settings calendar auto` adds those without asking (still logged). `/actions` shows the last 15.
+- Events Violet adds to Google Calendar are skipped by the Google Calendar feed import.
+
 ## Formatting and the daily brief
 
 - `fmt.py`: the one formatter (Telegram HTML). Section headers "📅 <b>TODAY</b>", bold times

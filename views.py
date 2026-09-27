@@ -204,4 +204,5 @@ def reminder_view(it: schedule.Item, lead: str, context: str | None = None) -> V
             details.append(fmt.sub("Needs host approval, check you got in"))
     if context:
         details.append(fmt.sub(context))
-    return fmt.view("\n".join([head, line] + [d for d in details if d]))
+    buttons = [[("✉️ Draft message", f"draft:{it.id}")]] if it.id and schedule.FOLLOW_UP.search(it.title) else []
+    return fmt.view("\n".join([head, line] + [d for d in details if d]), buttons)
