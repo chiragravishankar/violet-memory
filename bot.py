@@ -31,6 +31,7 @@ import ingest
 import onboarding
 import schedule
 import selfmodel
+import speech
 import transcribe
 import views
 import voice
@@ -53,6 +54,7 @@ COMMANDS = (
     "/connect_google  let me add calendar events and write emails (always with your OK)\n"
     "/actions  what I've done or offered to do\n"
     "/inbox  email that needs you (/email alerts on|off, /email quiet)\n"
+    "/voice mirror|on|off  voice replies: when you send voice (default), always, or never\n"
     "/settings calendar auto|ask  add calendar events without asking, or ask first\n"
     "/demo_time 2026-09-29 13:30  preview reminders at a moment"
 )
@@ -85,6 +87,59 @@ _db.commit()
 # Set while a voice note is being handled: the first reply gets the 🎙 quote on top and a
 # [📝 Full transcript] button, whichever path (answer, save, view) produces it.
 _voice_note: contextvars.ContextVar[dict | None] = contextvars.ContextVar("voice_note", default=None)
+
+
+# Set while handling a message whose reply should be spoken (per the user's /voice mode). The first
+# reply that goes out takes it: a voice note for conversation, a short spoken summary after a view.
+_speak: contextvars.ContextVar[dict | None] = contextvars.ContextVar("speak", default=None)
+VOICE_TIMINGS: list[float] = []
+
+
+def _take_speak() -> dict | None:
+    sp = _speak.get()
+    if sp is None or sp.get("done"):
+        return None
+    sp["done"] = True
+    return sp
+
+
+def _store_text(user_id, text: str) -> str:
+    token = uuid.uuid4().hex[:12]
+    _db.execute("INSERT INTO voice_transcripts (token, user_id, text, created_at) VALUES (?, ?, ?, ?)",
+                (token, int(user_id), text, datetime.now(timezone.utc).isoformat()))
+    _db.commit()
+    return token
+
+
+async def _voice_reply(send_voice, send_text, chat_id: int, user_id, text: str, structured: bool, note: dict | None,
+                       extra: list[tuple[str, str]] | None = None, also_text: bool = False) -> bool:
+    """Speak a reply. Returns False (nothing sent) if speech fails or is too slow: the caller sends text."""
+    try:
+        path, spoken, cut, took = await speech.make(user_id, text, structured)
+    except Exception as e:
+        log.info("voice reply fell back to text (%s)", type(e).__name__)
+        return False
+    VOICE_TIMINGS.append(took)
+    buttons = [] if structured else [[InlineKeyboardButton("📝 Show text", callback_data=f"tx:{_store_text(user_id, text)}")]]
+    if extra:
+        buttons.append([InlineKeyboardButton(label, callback_data=action[:64]) for label, action in extra])
+    if note is not None:
+        buttons = buttons or [[]]
+        buttons[0].append(InlineKeyboardButton("📝 Full transcript", callback_data=f"tr:{note['token']}"))
+    try:
+        with open(path, "rb") as f:
+            msg = await send_voice(voice=f, caption=note["quote"] if note else None, parse_mode=ParseMode.HTML if note else None,
+                                   reply_markup=InlineKeyboardMarkup(buttons) if buttons and buttons[0] else None)
+        _track(chat_id, msg)
+    except Exception as e:
+        log.info("sending voice failed (%s)", type(e).__name__)
+        return False
+    finally:
+        path.unlink(missing_ok=True)  # temp audio never kept
+    log_raw("out", chat_id, chat_id, f"[voice] {spoken}")
+    if (cut or also_text) and not structured:
+        await send_text(text)  # the rest (or the links) is in the chat
+    return True
 
 
 def _take_voice_note() -> dict | None:
@@ -137,7 +192,20 @@ def _track(chat_id: int, msg) -> None:
 
 
 async def reply(update: Update, text: str) -> None:
-    """Send text that is already in Violet's voice."""
+    """Send text that is already in Violet's voice (or speak it, if this reply should be spoken)."""
+    sp = _take_speak()
+    if sp is not None:
+        await update.effective_chat.send_action(ChatAction.RECORD_VOICE)
+        note = _voice_note.get()
+
+        async def text_too(t):
+            _track(update.effective_chat.id, await update.effective_message.reply_text(t))
+
+        if await _voice_reply(update.effective_message.reply_voice, text_too, update.effective_chat.id,
+                              update.effective_user.id, text, False, note):
+            _take_voice_note()
+            log_message("out", update, text)
+            return
     note = _take_voice_note()
     if note is None:
         _track(update.effective_chat.id, await update.effective_message.reply_text(text))
@@ -165,8 +233,22 @@ def _markup(v: View) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-async def send_view(bot, chat_id: int, v: View, edit_message=None):
-    """Send (or edit) a structured view as HTML; if Telegram rejects the formatting, resend plain."""
+async def send_view(bot, chat_id: int, v: View, edit_message=None, speak: bool = True):
+    """Send (or edit) a structured view as HTML; if Telegram rejects the formatting, resend plain.
+    If this reply should be spoken, a short spoken summary follows the view (never for action cards)."""
+    sp = _take_speak() if speak and edit_message is None else None
+    msg = await _send_view(bot, chat_id, v, edit_message)
+    if sp is not None:
+        await bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
+
+        async def no_text(t):
+            return None
+
+        await _voice_reply(lambda **k: bot.send_voice(chat_id, **k), no_text, chat_id, chat_id, v.plain, True, None)
+    return msg
+
+
+async def _send_view(bot, chat_id: int, v: View, edit_message=None):
     note = _take_voice_note() if edit_message is None else None
     if note is not None:
         v = View(f"{note['quote']}\n\n{v.html}", v.buttons + [[("📝 Full transcript", f"tr:{note['token']}")]], v.more)
@@ -206,7 +288,7 @@ async def offer_card(bot, chat_id: int, user_id, action_id: str) -> None:
     if a.type == "calendar_add" and actions.calendar_mode(user_id) == "auto" and gaccount.connected():
         await _send_outcome(bot, chat_id, a.id, await actions.approve(user_id, a.id, "do", "setting"))
         return
-    msg = await send_view(bot, chat_id, actions.card(a))
+    msg = await send_view(bot, chat_id, actions.card(a), speak=False)  # cards are never voiced
     if msg is not None:
         actions.set_card_message(a.id, msg.message_id)
 
@@ -214,7 +296,7 @@ async def offer_card(bot, chat_id: int, user_id, action_id: str) -> None:
 async def _send_outcome(bot, chat_id: int, action_id: str, o) -> None:
     text = fmt.esc(o.text) + (f" {fmt.link(o.link, 'Open')}" if o.link else "")
     buttons = [[("↩️ Undo", f"act:undo:{action_id}")]] if o.undo else []
-    await send_view(bot, chat_id, View(text, buttons))
+    await send_view(bot, chat_id, View(text, buttons), speak=False)
     if o.sending:
         asyncio.get_running_loop().create_task(_send_after_delay(bot, chat_id, action_id))
 
@@ -390,6 +472,20 @@ async def inbox_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_view(context.bot, update.effective_chat.id, inbox.inbox_view(update.effective_user.id))
 
 
+async def voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/voice mirror|on|off"""
+    log_message("in", update, inbound_text(update))
+    user_id = update.effective_user.id
+    arg = (context.args[0].lower() if context.args else "")
+    if arg in speech.MODES:
+        speech.set_mode(user_id, arg)
+        await reply(update, {"mirror": "Voice notes get a voice reply, texts get text.",
+                             "on": "I'll answer everything with a voice note (lists still come as text too).",
+                             "off": "Text only from now on."}[arg])
+    else:
+        await reply(update, f"Voice replies: {speech.mode(user_id)}. Use /voice mirror, /voice on or /voice off.")
+
+
 async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/email alerts on|off, /email quiet (brief only)"""
     log_message("in", update, inbound_text(update))
@@ -470,9 +566,23 @@ async def _flush_later(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None
     await handle_text(buf["update"], context, text, buf["rows"])
 
 
+_SAY_IT = re.compile(r"^\s*(say (that|it) out loud|read (that|it) (out|to me)|send (that|it) as (a )?voice( note)?|voice (that|it))\b", re.I)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, rows: list[int]) -> None:
     user_id = update.effective_user.id
     await update.effective_chat.send_action(ChatAction.TYPING)
+    was_voice = _voice_note.get() is not None
+    _speak.set({"done": False} if speech.wants_voice(user_id, was_voice) else None)
+    if _SAY_IT.match(text):
+        last = last_reply(user_id)
+        set_classification(rows, "say_it")
+        if not last:
+            await reply(update, "There's nothing to read out yet.")
+            return
+        _speak.set({"done": False})
+        await reply(update, re.sub(r"^\[voice\]\s*", "", last))
+        return
 
     # Conversations in progress about the profile take the message first.
     if onboarding.is_active(user_id):
@@ -574,6 +684,21 @@ async def _send_agent_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             last = n == len(r.views) - 1
             await send_view(context.bot, chat_id, View(html, v.buttons + (buttons if last else []), v.more))
     elif buttons or _URL.search(r.text or ""):
+        # A spoken reply keeps its buttons; links also go out as text (you can't tap a voice note).
+        if _speak.get() and not _speak.get().get("done") and r.text:
+            _take_speak()
+            await update.effective_chat.send_action(ChatAction.RECORD_VOICE)
+
+            async def linked_text(t):
+                await send_view(context.bot, chat_id, View(_linkify(t)), speak=False)
+
+            if await _voice_reply(update.effective_message.reply_voice, linked_text, chat_id, update.effective_user.id,
+                                  r.text, False, _voice_note.get(), extra=list(r.buttons), also_text=bool(_URL.search(r.text))):
+                _take_voice_note()
+                log_message("out", update, r.text)
+                for action_id in r.cards:
+                    await offer_card(context.bot, chat_id, update.effective_user.id, action_id)
+                return
         # Raw links become tappable text; buttons need an HTML message anyway.
         await send_view(context.bot, chat_id, View(_linkify(r.text or "Here you go."), buttons))
     else:
@@ -782,6 +907,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         r = await agent.respond(user_id, f"Draft an email for my follow-up \"{it.title}\" ({schedule.fmt_due(it)}). "
                                          "Use what you know about the person. If you don't have their email address, ask me for it.")
         await _send_agent_reply(update, context, r)
+    elif data.startswith("tx:"):
+        row = _db.execute("SELECT text FROM voice_transcripts WHERE token = ?", (data[3:],)).fetchone()
+        await send_view(context.bot, update.effective_chat.id, View(fmt.esc(row[0]) if row else "That text isn't around anymore."), speak=False)
     elif data.startswith("tr:"):
         row = _db.execute("SELECT text FROM voice_transcripts WHERE token = ?", (data[3:],)).fetchone()
         text = f"📝 <b>TRANSCRIPT</b>\n\n<i>{fmt.esc(row[0])}</i>" if row else "That transcript isn't around anymore."
@@ -1288,6 +1416,7 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("actions", actions_cmd))
     app.add_handler(CommandHandler("inbox", inbox_cmd))
     app.add_handler(CommandHandler("email", email_cmd))
+    app.add_handler(CommandHandler("voice", voice_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_file))
