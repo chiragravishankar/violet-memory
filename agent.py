@@ -7,6 +7,7 @@ Reply for bot.py to send.
 """
 
 import asyncio
+import time as time_mod
 import json
 import logging
 import os
@@ -123,6 +124,26 @@ def _date(s: str | None, default: date) -> date:
         return default
 
 
+_MEMORY_Q = re.compile(r"\b(what did|did (?:i|he|she|they|we)|said|say about|told|mention\w*|remember|recall|last time|"
+                       r"document|file|pdf|slides|notes?|connect\w*|related|how do i know|where did i meet|history)\b", re.I)
+_LOCAL_Q = re.compile(r"\b(my name|who am i|am i studying|my (?:program|major|school|degree|goals?)|due|deadlines?|"
+                      r"tomorrow|today|tonight|this week|next week|weekend|schedule|calendar|class(?:es)?|exams?|"
+                      r"events?|happening|follow ?ups?|emails?|inbox)\b", re.I)
+_MIXED_Q = re.compile(r"\b(who(?:'s| is| was)|working on|projects?|about)\b", re.I)
+
+
+def route_for(text: str) -> str:
+    """local: profile, people store, schedule, events and follow-ups answer it; memory: it needs long-term
+    memory; mixed: local first, with memory looked up in parallel in case it adds something."""
+    if _MEMORY_Q.search(text):
+        return "memory"
+    if _LOCAL_Q.search(text):
+        return "local"
+    if _MIXED_Q.search(text) or text.rstrip().endswith("?"):
+        return "mixed"
+    return "local"
+
+
 @dataclass
 class Turn:
     user_id: str
@@ -132,6 +153,9 @@ class Turn:
     connect: bool = False  # something was saved: build the graph afterwards
     tools_used: list[str] = field(default_factory=list)
     cards: list[str] = field(default_factory=list)  # action ids proposed this turn (pending until he approves)
+    memory: asyncio.Task | None = None  # cloud recall for his message, started before the first model call
+    started: float = 0.0
+    paths: list[str] = field(default_factory=list)  # what answered: profile, people, schedule, buffer, memory...
 
 
 def _next_items(turn: Turn, n: int, kinds: set[str] | None, after: date) -> list[dict]:
@@ -154,9 +178,38 @@ async def t_get_next_items(turn: Turn, n: int = 3, kinds: list[str] | None = Non
     return {"items": _next_items(turn, max(1, min(int(n), 10)), _kinds(kinds), turn.now.date())}
 
 
+MEMORY_BUDGET = 8.0  # seconds from the start of the turn that a reply may wait for cloud memory
+
+
+async def _memory(turn: Turn, query: str, grace: float | None = None) -> str:
+    """Cloud memory for this turn: the lookup started with the message if there is one, else a new
+    (cached) lookup. grace caps the wait, e.g. when local data already answered."""
+    left = max(1.0, MEMORY_BUDGET - (time_mod.monotonic() - turn.started))
+    wait = min(left, grace) if grace is not None else left
+    if turn.memory is None:
+        if grace is not None and grace < 2:
+            turn.paths.append("memory:skipped")
+            return ""
+        turn.memory = brain.start_recall(turn.user_id, query, wait=left)
+    t = time_mod.monotonic()
+    try:
+        text = await asyncio.wait_for(asyncio.shield(turn.memory), wait)
+    except asyncio.TimeoutError:
+        turn.paths.append(f"memory:not-ready({wait:.1f}s)")
+        return ""
+    turn.paths.append(f"memory:{'hit' if text else 'empty'}({time_mod.monotonic() - t:.1f}s)")
+    return text
+
+
 async def t_search_memory(turn: Turn, query: str) -> dict:
-    text = await brain.context_for(turn.user_id, query, wait=8)
-    return {"found": text[:2500] or brain.fallback_note() or "nothing relevant"}
+    just = brain.fresh(turn.user_id, query)
+    if just:
+        turn.paths.append("buffer")
+    text = await _memory(turn, query)
+    out = {"found": text[:2500] or brain.fallback_note() or "nothing relevant"}
+    if just:
+        out["just_told"] = just  # the last few minutes, not searchable in long-term memory yet
+    return out
 
 
 async def t_get_profile(turn: Turn) -> dict:
@@ -200,8 +253,18 @@ async def t_find_people(turn: Turn, query: str) -> dict:
     q = query.lower()
     people = [f["text"] for f in selfmodel.get_profile(turn.user_id)["people"]
               if not q or any(w in f["text"].lower() for w in re.findall(r"[a-z]+", q) if len(w) > 2)]
-    mem = await brain.context_for(turn.user_id, f"Who is {query}? How do I know them?", wait=8)
-    return {"from_profile": people, "from_memory": mem[:1500] or brain.fallback_note() or "nothing"}
+    just = brain.fresh(turn.user_id, query)
+    words = [w for w in re.findall(r"[a-z]+", q) if len(w) > 2]
+    d = turn.now.date()
+    cal = [_entry_json(e) for e in schedule.agenda_entries(turn.user_id, d - timedelta(days=7), d + timedelta(days=21), turn.now)
+           if words and any(w in e.title.lower() for w in words)][:5]
+    turn.paths += ["people"] * bool(people) + ["schedule"] * bool(cal) + ["buffer"] * bool(just)
+    # Local data first: if the profile or the last few minutes know them, only use memory that's already back.
+    mem = await _memory(turn, f"Who is {query}? How do I know them?", grace=1.0 if (people or just) else None)
+    out = {"from_profile": people, "on_calendar": cal, "from_memory": mem[:1500] or ("" if people or just else brain.fallback_note()) or "nothing"}
+    if just:
+        out["just_told"] = just
+    return out
 
 
 async def t_get_followups(turn: Turn) -> dict:
@@ -210,6 +273,11 @@ async def t_get_followups(turn: Turn) -> dict:
     d = turn.now.date()
     ents = schedule.agenda_entries(turn.user_id, d, d + timedelta(days=7), turn.now, schedule.DEADLINE_KINDS)
     return {"followups": [_entry_json(e) for e in ents if brief._FOLLOW_UP.search(e.title)]}
+
+
+async def t_correct_memory(turn: Turn, new_fact: str, replaces: str = "") -> dict:
+    await brain.correct(turn.user_id, new_fact, replaces)  # old items are removed in the background
+    return {"corrected": True}
 
 
 async def t_save_memory(turn: Turn, text: str) -> dict:
@@ -344,7 +412,9 @@ TOOLS = [
         {"start": {"type": "string", "description": "YYYY-MM-DD"}, "end": {"type": "string", "description": "YYYY-MM-DD, inclusive; same as start for one day"},
          "kinds": _KINDS_PROP}, ["start", "end"]),
     _fn("get_next_items", "The next n things on his calendar from now.", {"n": {"type": "integer"}, "kinds": _KINDS_PROP}),
-    _fn("search_memory", "Search what he has told you, files he sent and his calendars (people, projects, notes).",
+    _fn("search_memory", "Search long-term memory: past conversations, files he sent, connections between people and "
+        "projects, what someone said about something. Slower than the other tools; not for his name, program, goals, "
+        "people you already have in the profile, or his schedule. Also returns just_told: what he said in the last few minutes.",
         {"query": {"type": "string"}}, ["query"]),
     _fn("get_profile", "His profile: identity, academics, goals, people, preferences, patterns."),
     _fn("find_events", "NYU Events and Luma events relevant to him, best first, with why they fit and clashes.",
@@ -353,7 +423,7 @@ TOOLS = [
     _fn("respond_to_event", "Act on an event he's reacting to (going adds it to his calendar with reminders).",
         {"event_id": {"type": "string"}, "action": {"type": "string", "enum": ["going", "later", "not_for_me", "more_like_this"]}},
         ["event_id", "action"]),
-    _fn("find_people", "What you know about a person (profile and memory).", {"query": {"type": "string"}}, ["query"]),
+    _fn("find_people", "What you know about a person: profile, calendar, what he just told you, and memory.", {"query": {"type": "string"}}, ["query"]),
     _fn("get_followups", "Follow-ups with people due in the next week."),
     _fn("save_memory", "Keep a durable fact he told you (people, plans, projects, preferences). Never chit-chat, questions or venting.",
         {"text": {"type": "string", "description": "The fact, in his words or close to them"}}, ["text"]),
@@ -365,6 +435,11 @@ TOOLS = [
     _fn("add_person", "Remember a person he met or mentioned: name, relationship, context.",
         {"name": {"type": "string"}, "relationship": {"type": "string"}, "context": {"type": "string"}}, ["name"]),
     _fn("mark_done", "Mark an upcoming deadline or item done (stops its reminders).", {"item": {"type": "string"}}, ["item"]),
+    _fn("correct_memory", "He corrected something he told you before (a name, deadline, role, relationship, preference, "
+        "code word...). Removes the old version from memory and saves the new one. Use this instead of save_memory for "
+        "corrections; for facts about himself also call update_profile.",
+        {"new_fact": {"type": "string", "description": "The corrected fact as a full sentence"},
+         "replaces": {"type": "string", "description": "The old version it replaces, if known"}}, ["new_fact"]),
     _fn("update_profile", "Correct or add a fact about him (name, program, goals, preferences).",
         {"fact": {"type": "string", "description": "The correction in plain words"}}, ["fact"]),
     _fn("render_view", "Send a formatted list with your reply. Only when a list is genuinely the best answer "
@@ -393,7 +468,7 @@ IMPL = {
     "find_people": t_find_people, "get_followups": t_get_followups, "save_memory": t_save_memory,
     "add_schedule_item": t_add_schedule_item, "add_person": t_add_person, "mark_done": t_mark_done,
     "update_profile": t_update_profile, "render_view": t_render_view, "add_button": t_add_button,
-    "propose_action": t_propose_action, "save_contact_email": t_save_contact_email, "search_email": t_search_email,
+    "propose_action": t_propose_action, "correct_memory": t_correct_memory, "save_contact_email": t_save_contact_email, "search_email": t_search_email,
 }
 
 
@@ -421,6 +496,10 @@ How you work (you have tools; use them, don't guess about his calendar, people o
   friend. Use his memory and profile only when it genuinely makes the answer better, never as decoration.
 - Campus questions (NYU buildings, services, how things work): answer from general knowledge and the
   events or memory tools. If you're not sure, say so plainly rather than guessing.
+- Answer from what's fastest first: the profile above, get_profile, find_people, get_agenda and get_followups.
+  Use search_memory only when the question needs more (past conversations, documents, how people and things
+  connect, what someone said about something). just_told is what he told you minutes ago: trust it.
+- When he corrects something he told you before, use correct_memory (plus update_profile for facts about himself).
 - Only save durable facts: people (add_person), dated items (add_schedule_item), plans, projects,
   preferences (save_memory). Don't save chit-chat, questions, venting or small talk.
 - For events: find_events, then either recommend one or two in words (with their links), or, for three
@@ -463,11 +542,19 @@ async def _call(messages: list, model: str):
 async def respond(user_id, text: str, now: datetime | None = None) -> Reply:
     """Run the agent on one message and return the reply. Records both sides of the conversation."""
     now = now or datetime.now(TZ)
-    turn = Turn(str(user_id), now)
+    turn = Turn(str(user_id), now, started=time_mod.monotonic())
+    route = route_for(text)
+    if route != "local":  # start the cloud lookup now, in parallel with the model deciding what to do
+        turn.memory = brain.start_recall(user_id, text, wait=MEMORY_BUDGET)
     recent = [m["content"] for m in history(user_id) if m["role"] == "assistant"][-5:]
     system = (voice.system_prompt(user_id, recent) + "\n" + RULES.format(last_shown=last_shown(user_id))
               + f"\nRight now it is {now:%A, %B} {now.day}, {now.year}, {fmt.fmt_time(now.time())} in New York "
                 f"(tomorrow is {(now + timedelta(days=1)):%A %b} {(now + timedelta(days=1)).day}).")
+    just = brain.fresh(user_id)  # local and instant: what he said minutes ago that memory can't search yet
+    if just:
+        system += ("\nWhat he told you in the last few minutes (not in long-term memory yet; trust it):\n- "
+                   + "\n- ".join(just))
+        turn.paths.append("buffer")
     messages = [{"role": "system", "content": system}] + history(user_id) + [{"role": "user", "content": text}]
     # Record his message before any tool runs: an address he types in this very message counts as given.
     remember_turn(user_id, "user", text)
@@ -503,6 +590,9 @@ async def respond(user_id, text: str, now: datetime | None = None) -> Reply:
 
         messages += await asyncio.gather(*(run(c) for c in msg.tool_calls))
     log.info("agent: %s tools=%s views=%d", model, turn.tools_used, len(turn.views))
+    used = [p for p in turn.paths if p.startswith("memory:hit")]
+    log.info("answer: route=%s path=%s via=%s in %.1fs", route, "memory" if used else ("buffer" if "buffer" in turn.paths else "local"),
+             ",".join(dict.fromkeys(turn.paths)) or "profile/chat", time_mod.monotonic() - turn.started)
 
     budget, heart_ok = voice.emoji_budget(recent)
     if not heart_ok:

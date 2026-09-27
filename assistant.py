@@ -212,12 +212,12 @@ async def correct(user_id, text: str, last_reply: str | None = None, recent: lis
         # "i am chirag ravishankar": set the name directly, no model involved.
         name = " ".join(w[:1].upper() + w[1:] for w in m.group(1).split())
         selfmodel.set_identity(user_id, name=name)
-        await brain.save(user_id, f"My name is {name}.", kind="correction")
+        await brain.correct(user_id, f"My name is {name}.", "what my name is")
         draft = f"Fixed his name: he is {name}. Own the mistake briefly."
     else:
         instruction = text if not last_reply else f'You had just said: "{last_reply[:300]}". The user replied: "{text}"'
         changes = await selfmodel.edit(user_id, instruction)
-        await brain.save(user_id, "; ".join(changes) if changes else text, kind="correction")
+        await brain.correct(user_id, "; ".join(changes) if changes else text, text)
         draft = ("Fixed. What changed: " + "; ".join(changes)) if changes else "Took the correction on board."
     return await voice.say(user_id, draft, kind="correction", user_message=text, recent=recent)
 

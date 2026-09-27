@@ -1089,3 +1089,11 @@ def parse_range(text: str, today: date) -> tuple[date, date, str] | None:
     if "today" in words or "tonight" in words:
         return today, today, "today"
     return None
+
+
+def next_reminder_at(kinds: tuple[str, ...] = ("class", "class_session")) -> datetime | None:
+    """When the next unsent reminder for these item kinds fires (used to wake memory ahead of it)."""
+    q = ",".join("?" * len(kinds))
+    row = _db.execute(f"SELECT MIN(r.remind_at) FROM reminders r JOIN items i ON i.id = r.item_id "
+                      f"WHERE r.sent = 0 AND i.kind IN ({q})", kinds).fetchone()
+    return datetime.fromisoformat(row[0]) if row and row[0] else None

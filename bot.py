@@ -539,7 +539,7 @@ _buffers: dict[int, dict] = {}
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    brain.touch()  # start waking hosted memory while we work on the reply
+    brain.touch("user is messaging")  # start waking hosted memory while we work on the reply
     text = update.effective_message.text
     user_id = update.effective_user.id
     row = log_message("in", update, _FEED_URL.sub("<feed url>", text))
@@ -1091,7 +1091,7 @@ async def demo_time(user_id, at: datetime) -> list:
 
 
 async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    brain.touch()  # start waking hosted memory while we work on the reply
+    brain.touch("user is messaging")  # start waking hosted memory while we work on the reply
     msg = update.effective_message
     user_id = update.effective_user.id
     log_message("in", update, inbound_text(update))
@@ -1146,7 +1146,7 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Voice notes, audio files and video notes: transcribe, then handle exactly like typed text."""
-    brain.touch()  # start waking hosted memory while we work on the reply
+    brain.touch("user is messaging")  # start waking hosted memory while we work on the reply
     msg = update.effective_message
     media = msg.voice or msg.audio or msg.video_note
     user_id = update.effective_user.id
@@ -1377,6 +1377,26 @@ async def brief_loop(app: Application) -> None:
         await asyncio.sleep(60)
 
 
+WARM_AHEAD = timedelta(minutes=4)
+
+
+async def warm_loop(app: Application) -> None:
+    """Wake hosted memory a few minutes before jobs that read it (the morning brief or weekly preview,
+    class reminders), so they don't hit a cold start. Only then; user messages wake it on their own."""
+    while True:
+        try:
+            now = datetime.now(schedule.TZ)
+            soon = now + WARM_AHEAD
+            if any(brief.due(u, soon) and not brief.due(u, now) for u in event_users()):
+                brain.touch("brief in a few minutes")
+            nxt = schedule.next_reminder_at()
+            if nxt and now <= nxt <= soon:
+                brain.touch("class reminder in a few minutes")
+        except Exception:
+            log.exception("warm loop error")
+        await asyncio.sleep(60)
+
+
 async def post_init(app: Application) -> None:
     await brain.start()  # Cognee Cloud: connect on this loop before any memory operation
     n = actions.expire_stale_sends()  # a send cut off by a restart never goes out late
@@ -1389,6 +1409,7 @@ async def post_init(app: Application) -> None:
     app.create_task(events_loop(app))
     app.create_task(brief_loop(app))
     app.create_task(email_loop(app))
+    app.create_task(warm_loop(app))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

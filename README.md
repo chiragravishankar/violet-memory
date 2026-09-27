@@ -230,3 +230,28 @@ Memory lives in Cognee Cloud by default (`COGNEE_MODE=cloud`, with `COGNEE_SERVI
 - **Migration:** run `scripts/migrate_to_cloud.py`, with `--dry-run` first. Stop the bot before
   running it.
 - **Checks:** `scripts/memory_check.py` runs a round trip and measures latency.
+
+### Fast, consistent memory
+
+- **Routing.** `agent.route_for` sorts each message into one of three routes:
+  - **local:** your name, program and goals, schedule, events, follow-ups and email. Answered from
+    the profile, the people store and SQLite, with no cloud call.
+  - **memory:** past conversations, documents, what someone said.
+  - **mixed:** people and "working on". The cloud lookup starts in parallel with the first model
+    call, and local data wins if it's enough.
+
+  Each reply logs `answer: route=… path=… via=… in Ns`.
+- **Cache.** Recall answers are cached per user for 10 minutes. Any new save for that user clears it.
+- **Short-term buffer.** Memories from the last 15 minutes that the cloud hasn't built yet go into the
+  agent's prompt and tool results. They leave the buffer once the cloud reports the dataset processed.
+- **Corrections.** `correct_memory` and `brain.correct` work in this order:
+  1. Queue the new fact immediately, but hold its upload.
+  2. Find the items stating the old fact, using word overlap plus a small model.
+  3. `cognee.forget` those items.
+  4. Release the new fact.
+
+  Items that mix the old fact with other things are kept, and the new fact goes in as a
+  correction note.
+- **Warm-up.** The workspace is woken 4 minutes before the brief and class reminders, and when a user
+  starts messaging (only if it's been idle for 4 minutes or more).
+- **Timings.** `scripts/timing.py --label <name>` writes to `data/timings.json`.

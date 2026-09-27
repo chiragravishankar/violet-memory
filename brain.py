@@ -203,7 +203,7 @@ async def _connect_loop() -> None:
         await asyncio.sleep(wait)
 
 
-def touch() -> None:
+def touch(reason: str = "") -> None:
     """Called on user activity: if the hosted workspace may have gone to sleep, start waking it
     now so the reply that follows doesn't wait on it. Never blocks."""
     global _warming
@@ -211,6 +211,8 @@ def touch() -> None:
         return
     if _warming and not _warming.done():
         return
+    if reason:
+        log.info("memory: waking the workspace (%s)", reason)
     _warming = asyncio.create_task(_warm())
 
 
@@ -250,6 +252,10 @@ def _outbox_db() -> sqlite3.Connection:
             name TEXT NOT NULL, created TEXT NOT NULL, next_try TEXT NOT NULL, attempts INTEGER DEFAULT 0,
             sent TEXT, source TEXT DEFAULT 'live')""")
         _odb.execute("CREATE INDEX IF NOT EXISTS memory_outbox_due ON memory_outbox(sent, next_try)")
+        cols = {r[1] for r in _odb.execute("PRAGMA table_info(memory_outbox)")}
+        if "ready" not in cols:  # when the cloud confirmed the item is searchable
+            _odb.execute("ALTER TABLE memory_outbox ADD COLUMN ready TEXT")
+            _odb.execute("UPDATE memory_outbox SET ready=sent WHERE sent IS NOT NULL")
         _odb.commit()
     return _odb
 
@@ -264,12 +270,14 @@ def upload_name(text: str) -> str:
 
 
 def enqueue(user_id, text: str, kind: str = "message", source: str = "live", sent: str | None = None) -> None:
-    """Queue already-anchored text for the user's cloud dataset (or record it as already sent)."""
+    """Queue already-anchored text for the user's cloud dataset (or record it as already sent,
+    which also counts as searchable)."""
     db = _outbox_db()
     now = _now()
-    db.execute("INSERT INTO memory_outbox (user_id, kind, text, name, created, next_try, sent, source) "
-               "VALUES (?,?,?,?,?,?,?,?)", (str(user_id), kind, text, upload_name(text), now, now, sent, source))
+    db.execute("INSERT INTO memory_outbox (user_id, kind, text, name, created, next_try, sent, source, ready) "
+               "VALUES (?,?,?,?,?,?,?,?,?)", (str(user_id), kind, text, upload_name(text), now, now, sent, source, sent))
     db.commit()
+    clear_cache(user_id)
 
 
 def queued(user_id=None) -> int:
@@ -312,6 +320,8 @@ async def flush(user_id, wait: float = WRITE_WAIT) -> int:
             _ok()
             db.executemany("UPDATE memory_outbox SET sent=? WHERE id=?", [(_now(), r[0]) for r in rows])
             db.commit()
+            clear_cache(uid)
+            _confirm_later(uid, [r[0] for r in rows])
             sent += len(rows)
             log.info("memory: saved %d item(s) to %s in %.1fs", len(rows), dataset_for(uid), time.monotonic() - t)
 
@@ -475,9 +485,17 @@ def _first_text(results) -> str:
 
 async def context_for(user_id: int | str, question: str, wait: float = INTERACTIVE_WAIT) -> str:
     """What the graph knows that is relevant to the question, as text (no answer written).
-    The voice layer writes the answer from this. Pass wait=BACKGROUND_WAIT from background jobs."""
+    The voice layer writes the answer from this. Pass wait=BACKGROUND_WAIT from background jobs.
+    Answers are cached per user for CACHE_TTL; saving anything new for the user clears them."""
     if CLOUD:
-        return await _cloud_recall(user_id, question, wait, only_context=True)
+        hit = _cached(user_id, question)
+        if hit is not None:
+            return hit
+        gen = _generation[str(user_id)]
+        text = await _cloud_recall(user_id, question, wait, only_context=True)
+        if text and gen == _generation[str(user_id)]:  # nothing new was saved meanwhile
+            _cache.setdefault(str(user_id), {})[_qkey(question)] = (time.monotonic(), text)
+        return text
     try:
         results = await cognee.search(
             query_text=question,
@@ -573,6 +591,7 @@ async def forget_text(user_id: int | str, text: str) -> int:
 async def _cloud_forget_text(user_id, needle: str) -> int:
     """The cloud can't hand back item text cheaply, so match on the outbox's copy of what was
     saved, then delete the cloud items with the same content name."""
+    clear_cache(user_id)
     db = _outbox_db()
     rows = [r for r in db.execute("SELECT id, text, name, sent FROM memory_outbox WHERE user_id=?", (str(user_id),))
             if needle in r[1].lower() and not any(m in r[1][:300] for m in _BULK_MARKERS)]
@@ -623,6 +642,7 @@ async def replace_document(user_id, doc: str, old_id: str | None, node_set: list
         # node_set doesn't cross to the cloud; the profile is found by its "Core profile of" header
         await asyncio.wait_for(cognee.remember([doc], dataset_name=ds_name, self_improvement=False), WRITE_WAIT)
         _ok()
+        clear_cache(user_id)
         enqueue(user_id, doc, "profile", sent=_now())
         _outbox_db().execute("DELETE FROM memory_outbox WHERE user_id=? AND kind='profile' AND name!=?",
                              (str(user_id), want))
@@ -648,3 +668,235 @@ async def replace_document(user_id, doc: str, old_id: str | None, node_set: list
     except Exception as e:
         log.info("could not find profile document id (%s)", type(e).__name__)
         return None
+
+
+async def dataset_status(user_id) -> str | None:
+    """The cloud's processing status for the user's dataset (e.g. DATASET_PROCESSING_COMPLETED)."""
+    from cognee.api.v1.serve.state import get_remote_client
+
+    client = get_remote_client()
+    ds_id = await _cloud_dataset_id(dataset_for(user_id))
+    if client is None or ds_id is None:
+        return None
+    session = await client._get_session()
+    async with session.get(f"{client.service_url}/api/v1/datasets/status", params={"dataset": str(ds_id)}) as resp:
+        if resp.status >= 400:
+            return None
+        return (await resp.json()).get(str(ds_id))
+
+
+async def wait_searchable(user_id, timeout: float = 240.0, min_wait: float = 8.0) -> bool:
+    """Wait until the cloud has finished building the user's latest memories. remember() returns
+    before processing starts, so wait at least min_wait and need two finished readings in a row."""
+    if not CLOUD:
+        return True
+    t = time.monotonic()
+    await asyncio.sleep(min_wait)
+    done_once = False
+    while time.monotonic() - t < timeout:
+        try:
+            st = await dataset_status(user_id)
+        except Exception:
+            st = None
+        if st == "DATASET_PROCESSING_COMPLETED":
+            if done_once:
+                return True
+            done_once = True
+        else:
+            done_once = False
+        await asyncio.sleep(4)
+    return False
+
+
+async def forget_dataset(user_id) -> bool:
+    """Delete a user's whole cloud dataset (tests and cleanup only)."""
+    if not CLOUD:
+        return False
+    ds_id = await _cloud_dataset_id(dataset_for(user_id))
+    if ds_id is None:
+        return False
+    await cognee.forget(dataset_id=ds_id)
+    _outbox_db().execute("DELETE FROM memory_outbox WHERE user_id=?", (str(user_id),))
+    _outbox_db().commit()
+    return True
+
+
+# ---------- recall cache and prefetch ----------
+
+CACHE_TTL = 600.0  # seconds a recall answer is reused (cleared when the user saves something new)
+_cache: dict[str, dict[str, tuple[float, str]]] = {}
+_generation: dict[str, int] = defaultdict(int)  # bumped on every save, so in-flight answers aren't cached stale
+
+
+def _qkey(question: str) -> str:
+    import re
+
+    return " ".join(re.findall(r"[a-z0-9]+", question.lower()))
+
+
+def _cached(user_id, question: str) -> str | None:
+    hit = _cache.get(str(user_id), {}).get(_qkey(question))
+    if hit and time.monotonic() - hit[0] < CACHE_TTL:
+        return hit[1]
+    return None
+
+
+def clear_cache(user_id) -> None:
+    _cache.pop(str(user_id), None)
+    _generation[str(user_id)] += 1
+
+
+def start_recall(user_id, question: str, wait: float = INTERACTIVE_WAIT) -> asyncio.Task:
+    """Start a memory lookup now (in parallel with everything else); await the task when needed."""
+    return asyncio.ensure_future(context_for(user_id, question, wait=wait))
+
+
+# ---------- short-term buffer: what the user said in the last few minutes ----------
+
+FRESH_MINUTES = 15
+
+
+def _confirm_later(user_id, ids: list[int]) -> None:
+    """Mark items searchable once the cloud has finished building them."""
+    async def run():
+        ok = await wait_searchable(user_id, timeout=600)
+        if ok:
+            db = _outbox_db()
+            db.executemany("UPDATE memory_outbox SET ready=? WHERE id=?", [(_now(), i) for i in ids])
+            db.commit()
+            clear_cache(user_id)  # recall can see them now
+            log.info("memory: %d item(s) for %s are searchable", len(ids), dataset_for(user_id))
+        else:
+            log.warning("memory: %s still processing after 10 min; items stay in the short-term buffer", dataset_for(user_id))
+
+    try:
+        asyncio.get_running_loop().create_task(run())
+    except RuntimeError:
+        pass
+
+
+def _strip_anchor(text: str) -> str:
+    head, _, rest = text.partition("\n")
+    return rest.strip() if rest and head.rstrip().endswith(":") else text.strip()
+
+
+def fresh(user_id, query: str = "", limit: int = 8) -> list[str]:
+    """What the user told Violet in the last FRESH_MINUTES that the cloud can't search yet (queued or
+    still being built), newest first. With a query, only items that share a word with it."""
+    import re
+
+    if not CLOUD:
+        return []
+    since = (datetime.now(timezone.utc) - timedelta(minutes=FRESH_MINUTES)).isoformat(timespec="seconds")
+    day = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")
+    rows = _outbox_db().execute(
+        "SELECT text FROM memory_outbox WHERE user_id=? AND kind!='profile' AND ready IS NULL "
+        "AND (created>=? OR created>=?) ORDER BY id DESC LIMIT 50", (str(user_id), since, day)).fetchall()
+    items = [_strip_anchor(r[0]) for r in rows]
+    words = {w for w in re.findall(r"[a-z0-9]+", query.lower()) if len(w) > 2} - _STOP
+    if words:
+        items = [t for t in items if words & set(re.findall(r"[a-z0-9]+", t.lower()))]
+    return [t[:600] for t in items[:limit]]
+
+
+_STOP = {"the", "and", "who", "what", "whats", "what's", "when", "where", "does", "did", "about", "with", "that",
+         "this", "have", "has", "are", "was", "his", "her", "she", "him", "you", "your", "for", "from", "know",
+         "tell", "remember", "just", "now", "not", "any", "all", "how", "why", "which", "there", "they", "them"}
+
+
+# ---------- corrections that stick ----------
+
+PINPOINT_TASK = """The user corrected a fact. Decide which saved memory items to delete so the old fact is gone.
+
+New fact: {new}
+What it replaces: {old}
+
+Saved items (id: text):
+{items}
+
+Return JSON: {{"remove": [ids of items that ONLY state the replaced fact, so deleting them loses nothing else],
+"mixed": [ids of items that state the replaced fact but also contain other information]}}
+Only list items that really state the OLD version of this fact. When unsure, leave an item out."""
+
+
+async def correct(user_id, new_fact: str, replaces: str = "", wait: float = 12.0, background: bool = True) -> dict:
+    """Replace a fact: find the memory items that state the old version, delete them (cloud forget, or
+    drop them from the queue), then save the corrected fact. Items that mix the old fact with other
+    things are kept and the fact is saved as a correction note that overrides them.
+
+    The corrected fact is queued right away (so the short-term buffer has it), but held back from the
+    cloud until the old items are gone. background=True returns without waiting for that cleanup."""
+    uid = str(user_id)
+    if not CLOUD:
+        await save(uid, new_fact, kind="correction")
+        return {"removed": 0, "note": True}
+    text = anchor(uid, new_fact, "correction")
+    db = _outbox_db()
+    now = _now()
+    cur = db.execute("INSERT INTO memory_outbox (user_id, kind, text, name, created, next_try, source) "
+                     "VALUES (?,?,?,?,?,?,?)", (uid, "correction", text, upload_name(text), now, "9999", "live"))
+    db.commit()
+    clear_cache(uid)
+    _known.add(dataset_for(uid))
+    job = _finish_correction(uid, cur.lastrowid, new_fact, replaces, wait)
+    if background:
+        asyncio.get_running_loop().create_task(job)
+        return {"removed": None, "note": None}
+    return await job
+
+
+async def _finish_correction(uid: str, row_id: int, new_fact: str, replaces: str, wait: float) -> dict:
+    import re
+
+    import llm
+
+    removed, mixed = [], []
+    db = _outbox_db()
+    try:
+        words = {w for w in re.findall(r"[a-z0-9]+", f"{replaces} {new_fact}".lower()) if len(w) > 2} - _STOP
+        rows = db.execute("SELECT id, text, name, sent FROM memory_outbox WHERE user_id=? AND kind!='profile' AND id!=? "
+                          "ORDER BY id DESC LIMIT 400", (uid, row_id)).fetchall()
+        scored = sorted(((len(words & set(re.findall(r"[a-z0-9]+", r[1].lower()))), r) for r in rows),
+                        key=lambda x: -x[0])
+        cands = [r for n, r in scored if n >= 2][:25]
+        if cands:
+            try:
+                data = await asyncio.wait_for(llm.chat_json([{"role": "user", "content": PINPOINT_TASK.format(
+                    new=new_fact, old=replaces or "(the earlier version of this fact)",
+                    items="\n".join(f"{r[0]}: {_strip_anchor(r[1])[:500]}" for r in cands))}]), wait)
+                ids = {int(i) for i in data.get("remove") or [] if str(i).isdigit()}
+                mixed = [int(i) for i in data.get("mixed") or [] if str(i).isdigit()]
+                removed = [r for r in cands if r[0] in ids]
+            except (asyncio.TimeoutError, Exception) as e:
+                log.info("correct: could not pinpoint old items (%s)", _safe(e))
+        if removed:
+            await _delete_items(uid, removed)
+    finally:
+        note = not removed or bool(mixed)
+        if not note:  # the old version is gone: store the new fact plainly
+            text = anchor(uid, new_fact, "message")
+            db.execute("UPDATE memory_outbox SET kind='message', text=?, name=? WHERE id=?", (text, upload_name(text), row_id))
+        db.execute("UPDATE memory_outbox SET next_try=? WHERE id=?", (_now(), row_id))  # release it
+        db.commit()
+        clear_cache(uid)
+    log.info("memory: correction for %s removed %d old item(s)%s", dataset_for(uid), len(removed),
+             ", kept a correction note" if note else "")
+    await flush(uid)
+    return {"removed": len(removed), "note": note}
+
+
+async def _delete_items(uid: str, rows: list) -> None:
+    """Delete outbox rows (id, text, name, sent): unsent ones just leave the queue, sent ones are
+    forgotten in the cloud by matching content name."""
+    db = _outbox_db()
+    sent_names = {r[2] for r in rows if r[3]}
+    if sent_names and connected():
+        try:
+            ds_id, items = await asyncio.wait_for(_cloud_items(dataset_for(uid)), 20)
+            targets = [d for d in items if Path(str(d.name)).stem in sent_names]
+            await asyncio.gather(*(cognee.forget(data_id=d.id, dataset_id=ds_id) for d in targets))
+        except (asyncio.TimeoutError, Exception) as e:
+            log.warning("correct: cloud forget failed (%s)", _safe(e))
+    db.executemany("DELETE FROM memory_outbox WHERE id=?", [(r[0],) for r in rows])
+    db.commit()
+    clear_cache(uid)
