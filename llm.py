@@ -33,12 +33,22 @@ def client() -> AsyncOpenAI:
     return _client
 
 
+def track(resp) -> None:
+    """Count a completion's tokens against the user whose message is being handled."""
+    import users
+
+    u = getattr(resp, "usage", None)
+    if u is not None:
+        users.record(users.acting.get(), "tokens", getattr(u, "total_tokens", 0) or 0)
+
+
 async def chat(messages: list, json_mode: bool = False, model_name: str | None = None,
                temperature: float = 0) -> str:
     kwargs = {"response_format": {"type": "json_object"}} if json_mode else {}
     resp = await client().chat.completions.create(
         model=model_name or model(), messages=messages, temperature=temperature, **kwargs
     )
+    track(resp)
     return resp.choices[0].message.content or ""
 
 

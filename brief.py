@@ -15,6 +15,7 @@ import brain
 import events
 import fmt
 import llm
+import paths
 import schedule
 import selfmodel
 import views
@@ -35,7 +36,7 @@ _ADVICE = re.compile(r"^(prepare|prep|be |focus|stay|remember|make sure|don't|do
 BRIEF_MAX_LINES = 28  # a busy morning gets a little more room before "Show more"
 _FOLLOW_UP = schedule.FOLLOW_UP
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "violet.db"
+DB_PATH = paths.VIOLET_DB
 _db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
 _db.execute("""CREATE TABLE IF NOT EXISTS briefs (
     user_id TEXT NOT NULL,

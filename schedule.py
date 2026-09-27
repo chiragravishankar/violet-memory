@@ -12,6 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import llm
+import paths
 
 log = logging.getLogger("schedule")
 
@@ -31,7 +32,7 @@ CHUNK_CHARS = 1500  # small chunks: mini models skip items in long, dense lists
 CHUNK_OVERLAP = 200
 MAX_PARALLEL = 4
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "violet.db"
+DB_PATH = paths.VIOLET_DB
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 _db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
 _db.row_factory = sqlite3.Row
@@ -639,8 +640,12 @@ def add_event(user_id, it: Item, source: str) -> bool:
 FOLLOW_UP = re.compile(r"\b(follow[- ]?up|reach out|email|text|call|ping|reply to|get back to|send .* to)\b", re.I)
 
 
-def get_item(item_id: int) -> Item | None:
-    r = _db.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+def get_item(item_id: int, user_id=None) -> Item | None:
+    """One item by id; with user_id, only if it's that user's."""
+    if user_id is not None:
+        r = _db.execute("SELECT * FROM items WHERE id = ? AND user_id = ?", (item_id, str(user_id))).fetchone()
+    else:
+        r = _db.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
     return _row_to_item(r) if r else None
 
 
@@ -685,7 +690,7 @@ _TITLE_EMOJI = re.compile("[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6
 TITLES_TASK = """Clean up calendar titles for a student's phone. Keep meaning and names; make them short
 (at most 6 words, 40 characters) and natural. Drop tags like [OOF], course codes, "Due", filler like
 "How to" when the rest is clear, and the student's own name ({owner}). Examples:
-"30 Min Meeting between Keith Mauppa and {owner}" -> "Meeting with Keith Mauppa"
+"30 Min Meeting between Jordan Lee and {owner}" -> "Meeting with Jordan Lee"
 "How to Design Goods and Services That Fit the Operations Strategy" -> "Designing Goods and Services"
 "Weekly Economist Assignment #4 (Publication Date: September 26th)" -> "Economist Assignment #4"
 Keep numbers that tell items apart ("Ch 2", "#4"). If a title is already short and clear, return it as is.
@@ -1097,3 +1102,12 @@ def next_reminder_at(kinds: tuple[str, ...] = ("class", "class_session")) -> dat
     row = _db.execute(f"SELECT MIN(r.remind_at) FROM reminders r JOIN items i ON i.id = r.item_id "
                       f"WHERE r.sent = 0 AND i.kind IN ({q})", kinds).fetchone()
     return datetime.fromisoformat(row[0]) if row and row[0] else None
+
+
+def remove_item(user_id, item_id: int) -> bool:
+    """Delete one of the user's items and its reminders (undoing something added from an email)."""
+    cur = _db.execute("DELETE FROM items WHERE id = ? AND user_id = ?", (item_id, str(user_id)))
+    if cur.rowcount:
+        _db.execute("DELETE FROM reminders WHERE item_id = ?", (item_id,))
+    _db.commit()
+    return cur.rowcount > 0

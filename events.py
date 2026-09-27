@@ -17,6 +17,7 @@ from pathlib import Path
 import brain
 import eventsources
 import llm
+import paths
 import schedule
 import selfmodel
 import voice
@@ -34,7 +35,7 @@ DELIVERY_UNTIL = time(11, 0)  # if the bot was off all morning, skip the day rat
 SCORE_BATCH = 30
 SCORE_PARALLEL = 5
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "violet.db"
+DB_PATH = paths.VIOLET_DB
 _db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
 _db.row_factory = sqlite3.Row
 _db.execute("PRAGMA journal_mode=WAL")  # several modules share this file
@@ -191,11 +192,10 @@ He liked events like: {likes}
 He said "not for me" to: {dislikes}
 
 Calibration:
-- 90 to 100: a direct hit on something specific he's doing: one of his named projects (say which),
-  his courses, founders/startups/VC events, Leslie eLab or Entrepreneurial Institute programs,
-  employer recruiting in his target fields (VC, fintech, AI/ML, Web3, banks, hedge funds).
-- 70 to 89: clearly useful for a specific goal (say which), e.g. a PM or growth talk, a startup
-  workshop, a hackathon in his areas, a Tandon or Stern event on his topics.
+- 90 to 100: a direct hit on something specific he's doing (from the profile above): one of his named
+  projects (say which), his courses, clubs or programs he's in, employer recruiting in his target fields.
+- 70 to 89: clearly useful for one of his goals (say which), e.g. a talk, workshop or hackathon in his
+  areas, or an event at his school on his topics.
 - 40 to 60: generic career or skills workshops (resume, LinkedIn, interviews, soft skills),
   general networking, fairs outside his fields.
 - 0 to 30: no specific link to him (athletics, arts, library trainings, religious or cultural
@@ -204,12 +204,11 @@ Calibration:
 - "Internship search" is a reason only for recruiting events with employers or career fairs in his
   fields, never for generic workshops or club meetings.
 - A title starting with "DEADLINE:" is a sign-up deadline for a program; judge the program.
-- Boost in-person events in Brooklyn or Manhattan, Tandon, Stern, Wasserman, I-Hub, Leslie eLab.
+- Boost in-person events in Brooklyn or Manhattan, and at his school or the places he mentions.
 
 reason: one short line to him, 14 words at most, always "you"/"your" (never his name or "his"). It must say what THIS
 event actually is (a dinner, a panel, a workshop, a hackathon...) and which specific thing of his it
-fits: a named project (Violet Memory, ScraperKast), a goal (VC, fintech or AI internships, founders),
-a course, or the Leslie eLab credits proposal. Write each reason fresh for its event; never reuse
+fits: a named project, a goal, a course or a program from his profile, by name. Write each reason fresh for its event; never reuse
 wording from another event. Don't start with "Right up". No specific reason: score
 30 or less and say it's generic. Never invent facts about him.
 deadline: the registration, RSVP or application deadline as YYYY-MM-DD only if the text states a
@@ -400,7 +399,7 @@ class Scored:
     score: int
     reason: str
     deadline: date | None
-    conflicts: list[str]  # human descriptions, e.g. "your 1:00 PM meeting with Keith Mauppa"
+    conflicts: list[str]  # human descriptions, e.g. "your 1:00 PM meeting with Jordan Lee"
     class_conflict: bool  # clashes with a class or an exam: never suggested
     on_calendar: bool = False  # the same event is already on his calendar
     status: str | None = None

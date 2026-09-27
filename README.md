@@ -197,10 +197,16 @@ previews what would fire at that moment.
 
 ## Calendar feeds
 
-Set `BRIGHTSPACE_ICS_URL`, `GOOGLE_ICS_URL` and `CALENDAR_USER_ID` (your Telegram
-user id) in `.env`. Feed URLs are secrets: they are never logged, and sync errors
-only report the error type. Brightspace items that match ones from an uploaded PDF
-take them over, so nothing is duplicated.
+Each user connects their own Brightspace and Google Calendar feeds in chat: during onboarding, with
+`/connect`, or just by pasting the link. Violet fetches the link to check it ("Found 42 upcoming
+items"), then stores it encrypted (`VIOLET_SECRET_KEY`) in that user's feed settings.
+
+Feed URLs are secrets:
+- They're redacted from the message log and never sent to a model.
+- They're only ever shown masked.
+- Sync errors report only the error type.
+
+Brightspace items that match ones from an uploaded PDF take them over, so nothing is duplicated.
 
 Only one process can use the Cognee database at a time, so stop the bot before
 running scripts that import `brain.py`.
@@ -255,3 +261,48 @@ Memory lives in Cognee Cloud by default (`COGNEE_MODE=cloud`, with `COGNEE_SERVI
 - **Warm-up.** The workspace is woken 4 minutes before the brief and class reminders, and when a user
   starts messaging (only if it's been idle for 4 minutes or more).
 - **Timings.** `scripts/timing.py --label <name>` writes to `data/timings.json`.
+
+## Multiple users
+
+Violet is invite-only.
+- **Access.** A `users` table holds status (invited, active, waitlist, blocked), role (owner or user)
+  and per-user daily limits. The owner is `VIOLET_OWNER_ID`.
+- **Joining.** A new user sends `/start <code>`, then goes through a short onboarding: name, program,
+  what they're working on, goals, reply style, quiet hours, then optional calendar links.
+- **Strangers.** Anyone without a valid code gets one waitlist reply, rate-limited (once a day each,
+  30 an hour overall). Their message never reaches the agent or memory, and isn't logged.
+- **The gate.** A `TypeHandler` in group -1 runs before every handler. It only allows private chats
+  from active users, and marks the acting user for usage tracking.
+- **Owner commands:** `/invite [uses] [days]`, `/users`, `/block <id>`, `/unblock <id>`, `/usage`.
+
+**Isolation.**
+- Every table is keyed by `user_id`, and every query filters by it.
+- Each user has their own Cognee dataset (`user_<telegram id>`), and `brain.dataset_for` refuses
+  anything that isn't a plain id.
+- Agent tools get the user from the message sender, never from the model.
+- Buttons check ownership: transcripts, "show more" pages, action cards and emails.
+- The shared prompts only use a made-up example student, never real users' details.
+- `tests/test_isolation.py` must pass before committing. It runs the real handlers with a fake
+  Telegram and a fake Cognee, and checks every command, question, button, agent tool and background
+  job for cross-user leaks.
+
+**Shared vs personal.**
+- NYU Events and Luma are fetched once and shared.
+- Scores, picks and "going" are per user.
+- Calendar feeds, reminders, briefs and follow-ups run per active user.
+
+**Owner-only for now:** Gmail awareness, Google Calendar writes, sending email, and any action card.
+Other users hear "coming soon".
+
+**Limits.** Daily limits per user cover messages, voice minutes, documents and new memories
+(`users.DEFAULT_LIMITS`; the owner has none). Tokens and Cognee saves and recalls are tracked per
+user per day, and the owner can see them with `/usage`.
+
+**Email-derived schedule changes.** Deadlines and changes from trusted senders are applied
+automatically and announced with an Undo button. Trusted means NYU addresses, Brightspace/D2L, and
+people in the people store, which includes professors. Anyone else gets an "Add it?" card instead.
+
+**Demo.**
+- `tests/demo_multiuser.py new`: a new user from invite code to first `/week`.
+- `tests/demo_multiuser.py real`: the friend and the owner on real data, with the test turns
+  cleaned up afterwards.

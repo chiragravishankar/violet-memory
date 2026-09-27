@@ -29,12 +29,15 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+import paths
+import users
+
 load_dotenv()
 
 # Keep Cognee's databases next to this project instead of inside site-packages.
 _HERE = Path(__file__).resolve().parent
-os.environ.setdefault("DATA_ROOT_DIRECTORY", str(_HERE / "data" / "cognee_data"))
-os.environ.setdefault("SYSTEM_ROOT_DIRECTORY", str(_HERE / "data" / "cognee_system"))
+os.environ.setdefault("DATA_ROOT_DIRECTORY", str(paths.DATA_DIR / "cognee_data"))
+os.environ.setdefault("SYSTEM_ROOT_DIRECTORY", str(paths.DATA_DIR / "cognee_system"))
 # Cognee's session memory feeds earlier questions and answers back in as context, so one
 # wrong answer ("your name is Keith") keeps coming back. The profile and graph are the truth.
 os.environ.setdefault("CACHING", "false")
@@ -82,8 +85,12 @@ def _safe(e: BaseException) -> str:
 
 
 def dataset_for(user_id: int | str) -> str:
-    """Each user gets their own private dataset, named from their user id."""
-    return f"user_{user_id}"
+    """Each user gets their own private dataset, named from their user id. Nothing else can name a
+    dataset, so one user's memory calls can never reach another's."""
+    uid = str(user_id)
+    if not uid or not all(c.isalnum() or c in "_-" for c in uid):
+        raise ValueError("bad user id")
+    return f"user_{uid}"
 
 
 def is_connecting(user_id: int | str) -> bool:
@@ -238,7 +245,7 @@ async def _warm() -> None:
 
 # ---------- outbox (cloud writes) ----------
 
-_DB_PATH = _HERE / "data" / "violet.db"
+_DB_PATH = paths.VIOLET_DB
 _odb: sqlite3.Connection | None = None
 
 
@@ -318,6 +325,7 @@ async def flush(user_id, wait: float = WRITE_WAIT) -> int:
                             len(rows), dataset_for(uid), _safe(e), attempts, delay)
                 return sent
             _ok()
+            users.record(uid, "cognee_saves", len(rows))
             db.executemany("UPDATE memory_outbox SET sent=? WHERE id=?", [(_now(), r[0]) for r in rows])
             db.commit()
             clear_cache(uid)
@@ -350,8 +358,11 @@ async def _flush_loop() -> None:
 
 async def save(user_id: int | str, text: str, kind: str = "message") -> None:
     """Store text in the user's dataset, anchored to the user. Fast; call connect() afterwards.
-    Cloud mode only queues it (never waits on the network)."""
+    Cloud mode only queues it (never waits on the network). Things the user asked to keep count
+    toward their daily limit (raises users.LimitReached); calendar and email summaries don't."""
     ds = dataset_for(user_id)
+    if kind in ("message", "document", "correction"):
+        users.spend(user_id, "memory_saves")
     if CLOUD:
         enqueue(user_id, anchor(user_id, text, kind), kind)
     else:
@@ -404,6 +415,7 @@ async def _cloud_recall(user_id, question: str, wait: float, **kw) -> str:
         except asyncio.TimeoutError:
             return ""
     ds = dataset_for(user_id)
+    users.record(user_id, "cognee_recalls")
     t = time.monotonic()
     task = asyncio.ensure_future(cognee.recall(
         question, query_type=SearchType.GRAPH_COMPLETION, datasets=[ds], **kw))

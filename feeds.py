@@ -1,11 +1,11 @@
-"""Calendar feed sync: Brightspace (assignments) and Google Calendar (events).
+"""Calendar feed sync: each user's Brightspace (assignments) and Google Calendar (events).
 No channel code here.
 
-Feed URLs are secrets: they are read from .env and never logged or put in errors.
+Feed URLs are secrets: each user's links live encrypted in users.feeds and are never logged, put in
+errors or shown in full.
 """
 
 import logging
-import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -16,6 +16,7 @@ import recurring_ical_events
 
 import brain
 import schedule
+import users
 from schedule import TZ, Item
 
 log = logging.getLogger("feeds")
@@ -28,22 +29,41 @@ class FeedError(Exception):
     """Fetching or parsing a feed failed. The message never contains the URL."""
 
 
-@dataclass
-class Feed:
-    source: str  # brightspace, google
-    env: str  # name of the .env variable holding the URL
-
-
 # Brightspace first: its course names let Google class events be recognised.
-FEEDS = [Feed("brightspace", "BRIGHTSPACE_ICS_URL"), Feed("google", "GOOGLE_ICS_URL")]
+SOURCES = ["brightspace", "google"]
+NAMES = {"brightspace": "Brightspace", "google": "Google Calendar"}
+
+_URL = re.compile(r"(?:https?|webcal)://[^\s<>\"']+", re.I)
 
 
-def calendar_user() -> str | None:
-    """Telegram user id the feeds belong to."""
-    return os.getenv("CALENDAR_USER_ID") or os.getenv("GOOGLE_ICS_USER_ID")
+def find_link(text: str) -> tuple[str | None, str | None]:
+    """(source, url) if the text contains a calendar feed link, else (None, None). source is None
+    when it's a feed link but not clearly Brightspace or Google."""
+    for m in _URL.finditer(text or ""):
+        url = m.group(0).rstrip(".,);")
+        low = url.lower()
+        if "calendar.google.com" in low and ("/ical/" in low or low.endswith(".ics")):
+            return "google", url
+        if ("brightspace" in low or "/d2l/" in low) and ("feed" in low or "ical" in low or low.endswith(".ics")):
+            return "brightspace", url
+        if low.endswith(".ics") or "/ical/" in low or low.startswith("webcal"):
+            return None, url
+    return None, None
+
+
+def redact(text: str) -> str:
+    """The text with any calendar feed link replaced (for logs and anything sent to a model)."""
+    out = text or ""
+    while True:
+        _, url = find_link(out)
+        if not url:
+            return out
+        out = out.replace(url, "[calendar link hidden]")
 
 
 async def fetch(url: str) -> bytes:
+    if url.lower().startswith("webcal://"):
+        url = "https://" + url[9:]
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             resp = await client.get(url)
@@ -239,45 +259,60 @@ def memory_summary(source: str, added: list[Item]) -> str:
     return f"New items from my {name} (synced {schedule.fmt_day(today)}, {today.year}):\n" + "\n".join(lines)
 
 
-async def sync_feed(feed: Feed, user_id: str) -> schedule.SyncResult | None:
-    """Fetch, parse and store one feed, and save new items to memory.
-    Returns None if the feed is not configured. Call brain.connect(user_id) afterwards."""
-    url = os.getenv(feed.env)
+def _parse(source: str, data: bytes, user_id) -> list[Item]:
+    if source == "google":
+        courses = sorted({i.course for i in schedule.existing_items(user_id) if i.course})
+        return parse_google(data, courses)
+    return parse_brightspace(data)
+
+
+async def validate(source: str, url: str) -> int:
+    """Fetch and parse a link someone pasted; returns how many upcoming items it has.
+    Raises FeedError (never containing the URL) if it isn't a working calendar feed."""
+    data = await fetch(url)
+    items = parse_google(data, []) if source == "google" else parse_brightspace(data)
+    return len(items)
+
+
+async def sync_feed(user_id: str, source: str) -> schedule.SyncResult | None:
+    """Fetch, parse and store one of the user's feeds, and save new items to their memory.
+    Returns None if they haven't connected it. Call brain.connect(user_id) afterwards."""
+    url = users.get_feed(user_id, source)
     if not url:
         return None
-    data = await fetch(url)
-    if feed.source == "google":
-        courses = sorted({i.course for i in schedule.existing_items(user_id) if i.course})
-        items = parse_google(data, courses)
-    else:
-        items = parse_brightspace(data)
-    result = schedule.sync_events(user_id, items, feed.source)
+    items = _parse(source, await fetch(url), user_id)
+    result = schedule.sync_events(user_id, items, source)
     if result.added:
-        await brain.save(user_id, memory_summary(feed.source, result.added), kind="calendar")
+        await brain.save(user_id, memory_summary(source, result.added), kind="calendar")
+    users.mark_feed(user_id, source, "ok", len(items))
     log.info(
-        "%s sync: %d in feed, %d new, %d already there (%d taken over from PDF/chat, %d dates corrected), "
+        "%s sync for %s: %d in feed, %d new, %d already there (%d taken over from PDF/chat, %d dates corrected), "
         "%d updated, %d removed",
-        feed.source, result.in_feed, len(result.added), result.already, result.adopted,
+        source, user_id, result.in_feed, len(result.added), result.already, result.adopted,
         result.corrected, result.updated, result.removed,
     )
     return result
 
 
-async def sync_all() -> dict[str, schedule.SyncResult | str]:
-    """Sync every configured feed. Errors are reported by type only."""
-    user_id = calendar_user()
+async def sync_user(user_id: str) -> dict[str, schedule.SyncResult | str]:
+    """Sync one user's connected feeds. Errors are reported by type only."""
     results: dict[str, schedule.SyncResult | str] = {}
-    if not user_id:
-        return results
-    for feed in FEEDS:
+    for source in SOURCES:
         try:
-            r = await sync_feed(feed, user_id)
+            r = await sync_feed(user_id, source)
             if r is not None:
-                results[feed.source] = r
+                results[source] = r
         except FeedError as e:
-            log.warning("%s sync failed: %s", feed.source, e)
-            results[feed.source] = str(e)
+            log.warning("%s sync failed for %s: %s", source, user_id, e)
+            users.mark_feed(user_id, source, str(e))
+            results[source] = str(e)
         except Exception as e:
-            log.warning("%s sync failed: %s", feed.source, type(e).__name__)
-            results[feed.source] = type(e).__name__
+            log.warning("%s sync failed for %s: %s", source, user_id, type(e).__name__)
+            users.mark_feed(user_id, source, type(e).__name__)
+            results[source] = type(e).__name__
     return results
+
+
+async def sync_all() -> dict[str, dict[str, schedule.SyncResult | str]]:
+    """Sync every active user's feeds, one user at a time: {user_id: {source: result}}."""
+    return {uid: await sync_user(uid) for uid in users.active_ids() if users.feeds(uid)}

@@ -15,7 +15,8 @@ import uuid
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes,
+                          MessageHandler, TypeHandler, filters)
 
 import actions
 import agent
@@ -29,10 +30,12 @@ import gaccount
 import inbox
 import ingest
 import onboarding
+import paths
 import schedule
 import selfmodel
 import speech
 import transcribe
+import users
 import views
 import voice
 import fmt
@@ -51,6 +54,7 @@ COMMANDS = (
     "/undo  remove what your last file added\n"
     "/me  what I know about you (/me setup, /me edit, /me reflect)\n"
     "/forget <text>  make me forget something\n"
+    "/connect  add your Brightspace and Google calendars (/connect status)\n"
     "/connect_google  let me add calendar events and write emails (always with your OK)\n"
     "/actions  what I've done or offered to do\n"
     "/inbox  email that needs you (/email alerts on|off, /email quiet)\n"
@@ -58,11 +62,15 @@ COMMANDS = (
     "/settings calendar auto|ask  add calendar events without asking, or ask first\n"
     "/demo_time 2026-09-29 13:30  preview reminders at a moment"
 )
-FILES_DIR = Path(__file__).resolve().parent / "data" / "files"
+# Google features are owner-only for now, so other users don't see those commands.
+USER_COMMANDS = "\n".join(line for line in COMMANDS.split("\n")
+                          if not line.startswith(("/connect_google", "/actions", "/inbox", "/settings", "/demo_time")))
+COMMANDS += "\n/invite [uses] [days]  invite code (owner)\n/users  who's using Violet\n/block <id>, /unblock <id>\n/usage  today's usage"
+FILES_DIR = paths.FILES_DIR
 
 # ---------- SQLite message log ----------
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "messages.db"
+DB_PATH = paths.MESSAGES_DB
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db.execute(
@@ -156,6 +164,7 @@ def log_message(direction: str, update: Update, text: str | None, classification
 
 
 def log_raw(direction: str, user_id, chat_id, text: str | None, classification: str | None = None) -> int:
+    text = feeds.redact(text) if text else text  # calendar links are secrets: never stored
     cur = _db.execute(
         "INSERT INTO messages (ts, direction, user_id, chat_id, text, classification) VALUES (?, ?, ?, ?, ?, ?)",
         (datetime.now(timezone.utc).isoformat(), direction, user_id, chat_id, text, classification),
@@ -221,14 +230,14 @@ async def reply(update: Update, text: str) -> None:
     log_message("out", update, text)
 
 
-_more_pages: dict[str, list[str]] = {}
+_more_pages: dict[str, tuple[int, list[str]]] = {}  # token -> (chat it was sent to, pages)
 
 
-def _markup(v: View) -> InlineKeyboardMarkup | None:
+def _markup(v: View, chat_id: int) -> InlineKeyboardMarkup | None:
     rows = [[InlineKeyboardButton(label, callback_data=action[:64]) for label, action in row] for row in v.buttons]
     if v.more:
         token = secrets.token_hex(4)
-        _more_pages[token] = v.more
+        _more_pages[token] = (chat_id, v.more)
         rows.append([InlineKeyboardButton("Show more", callback_data=f"more:{token}")])
     return InlineKeyboardMarkup(rows) if rows else None
 
@@ -252,7 +261,7 @@ async def _send_view(bot, chat_id: int, v: View, edit_message=None):
     note = _take_voice_note() if edit_message is None else None
     if note is not None:
         v = View(f"{note['quote']}\n\n{v.html}", v.buttons + [[("📝 Full transcript", f"tr:{note['token']}")]], v.more)
-    markup = _markup(v)
+    markup = _markup(v, chat_id)
     try:
         if edit_message is not None:
             await edit_message.edit_text(v.html, parse_mode=ParseMode.HTML, reply_markup=markup,
@@ -283,7 +292,7 @@ async def offer_card(bot, chat_id: int, user_id, action_id: str) -> None:
     a = actions.get(action_id)
     if a is None:
         return
-    if str(user_id) != str(feeds.calendar_user()):
+    if not users.is_owner(user_id) or a.user_id != str(user_id):
         return  # the Google account is the owner's: nobody else gets cards that would act on it
     if a.type == "calendar_add" and actions.calendar_mode(user_id) == "auto" and gaccount.connected():
         await _send_outcome(bot, chat_id, a.id, await actions.approve(user_id, a.id, "do", "setting"))
@@ -386,6 +395,166 @@ def _kind(msg) -> str:
 # ---------- Handlers ----------
 
 
+
+# ---------- Access: the gate every update passes first ----------
+
+WAITLIST_TEXT = ("Hi! Violet is invite-only right now. Want to join the waitlist? You're on it now, and if you "
+                 "get an invite code, send /start followed by your code.")
+INVITE_ERRORS = {
+    "invalid": "That invite code doesn't work. Check it and send /start followed by the code again.",
+    "expired": "That invite code has expired. Ask for a new one.",
+    "used_up": "That invite code has already been used. Ask for a new one.",
+    "blocked": None,
+}
+_START_CODE = re.compile(r"^/start(?:@\w+)?\s+(\S+)")
+
+
+async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every handler. Active users pass (and are marked as the acting user). Everyone else
+    gets at most one rate-limited waitlist reply, or joins with /start <code>. Nothing a non-member sends
+    reaches the agent or memory, and their messages aren't logged."""
+    user, chat = update.effective_user, update.effective_chat
+    if user is None or chat is None or chat.type != "private":
+        raise ApplicationHandlerStop  # private chats only: no groups, no channels
+    uid = str(user.id)
+    if users.is_active(uid):
+        users.touch(uid)
+        users.acting.set(uid)
+        return
+    msg = update.effective_message
+    m = _START_CODE.match((msg.text or "") if msg else "")
+    if m:
+        ok, reason = users.redeem(m.group(1), uid, user.first_name)
+        if ok:
+            users.acting.set(uid)
+            log.info("user %s joined with an invite", uid)
+            await _welcome(update, context)
+        elif INVITE_ERRORS.get(reason):
+            if users.waitlist(uid, user.first_name):  # the same rate limit as the waitlist reply
+                await update.effective_message.reply_text(INVITE_ERRORS[reason])
+        raise ApplicationHandlerStop
+    if update.callback_query:
+        await update.callback_query.answer()
+    elif users.waitlist(uid, user.first_name) and msg is not None:
+        await msg.reply_text(WAITLIST_TEXT)
+    raise ApplicationHandlerStop
+
+
+async def _welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    draft, attach = onboarding.start(uid, "welcome")
+    await speak(update, draft, kind="question", attach=attach)
+
+
+async def _owner_only(update: Update) -> bool:
+    if users.is_owner(update.effective_user.id):
+        return True
+    await reply(update, "That one's only for Violet's owner.")
+    return False
+
+
+async def invite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/invite [max uses] [days valid], owner only."""
+    if not await _owner_only(update):
+        return
+    args = [a for a in context.args if a.isdigit()]
+    uses = int(args[0]) if args else 1
+    days = int(args[1]) if len(args) > 1 else 7
+    inv = users.create_invite(update.effective_user.id, max_uses=uses, days=days)
+    await reply(update, f"Invite code: {inv['code']}\nGood for {inv['max_uses']} "
+                        f"{'person' if inv['max_uses'] == 1 else 'people'}, until {inv['expires_at']:%b %d}.\n"
+                        f"They send: /start {inv['code']}")
+
+
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _owner_only(update):
+        return
+    lines = []
+    for u in users.listing():
+        seen = u["last_active"] or u["created_at"]
+        ago = datetime.now(timezone.utc) - datetime.fromisoformat(seen)
+        when = "just now" if ago < timedelta(minutes=5) else (
+            f"{int(ago.total_seconds() // 3600)}h ago" if ago < timedelta(days=2) else f"{ago.days}d ago")
+        role = " (owner)" if u["role"] == "owner" else ""
+        lines.append(f"{u['telegram_id']}  {u['name'] or '?'}{role}  {u['status']}  last active {when}")
+    await reply(update, "Users:\n" + "\n".join(lines) if lines else "No users yet.")
+
+
+async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _owner_only(update):
+        return
+    uid = (context.args or [""])[0]
+    await reply(update, f"Blocked {uid}." if uid and users.set_status(uid, "blocked") else "Usage: /block <telegram id> (not the owner).")
+
+
+async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _owner_only(update):
+        return
+    uid = (context.args or [""])[0]
+    await reply(update, f"{uid} is active again." if uid and users.set_status(uid, "active") else "Usage: /unblock <telegram id>")
+
+
+async def usage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/usage [YYYY-MM-DD], owner only: today's usage per user."""
+    if not await _owner_only(update):
+        return
+    day = context.args[0] if context.args else None
+    rows = users.usage_report(day)
+    if not rows:
+        await reply(update, "No usage yet today.")
+        return
+    keys = ["messages", "voice_minutes", "documents", "memory_saves", "tokens", "cognee_saves", "cognee_recalls"]
+    lines = [f"{r['name'] or r['user_id']}: " + ", ".join(f"{k} {r[k]:g}" for k in keys if r.get(k)) for r in rows]
+    await reply(update, f"Usage {day or 'today'} (UTC):\n" + "\n".join(lines))
+
+
+async def connect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/connect: add calendars. /connect status, /connect remove brightspace|google."""
+    log_message("in", update, inbound_text(update))
+    uid = update.effective_user.id
+    args = [a.lower() for a in context.args]
+    if args[:1] == ["status"]:
+        rows = users.feeds(uid)
+        text = "\n".join(f"{feeds.NAMES[r['source']]}: {r['items'] or 0} upcoming items, "
+                         f"{'working' if r['last_status'] == 'ok' else 'last sync failed (' + str(r['last_status']) + ')'}"
+                         for r in rows) or "No calendars connected yet. Send /connect to add one."
+        await reply(update, text)
+        return
+    if len(args) == 2 and args[0] == "remove" and args[1] in feeds.SOURCES:
+        await reply(update, f"Disconnected {feeds.NAMES[args[1]]}." if users.remove_feed(uid, args[1])
+                    else f"{feeds.NAMES[args[1]]} wasn't connected.")
+        return
+    draft, attach = onboarding.start(uid, "calendars")
+    await speak(update, draft, kind="question", attach=attach)
+
+
+async def _paste_feed(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """A calendar link pasted outside onboarding: check it, save it encrypted, sync it. True if handled.
+    The link never reaches the agent, memory or a model."""
+    source, url = feeds.find_link(text)
+    if not url:
+        return False
+    uid = update.effective_user.id
+    if source is None:
+        await reply(update, "That looks like a calendar link, but I can only connect Brightspace and Google Calendar "
+                            "links right now. Send /connect for the steps.")
+        return True
+    try:
+        n = await _with_typing(update, context, feeds.validate(source, url))
+    except feeds.FeedError as e:
+        await reply(update, f"That {feeds.NAMES[source]} link didn't work ({e}). Copy the full link again and resend it.")
+        return True
+    users.set_feed(uid, source, url, items=n)
+    try:
+        await _with_typing(update, context, feeds.sync_feed(str(uid), source))
+    except Exception as e:
+        log.warning("first sync failed (%s)", type(e).__name__)
+    await reply(update, f"Connected your {feeds.NAMES[source]}. Found {n} upcoming items.")
+    await send_view(context.bot, update.effective_chat.id, views.week_view(uid))
+    context.application.create_task(brain.connect(uid))
+    return True
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
     await speak(update, "First hello. You're Violet: he can text or voice-note you anything to keep (people he "
@@ -398,7 +567,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await speak(update, "Quick how-to: text or send a voice note (up to 5 minutes) with anything to keep, ask "
                         "anything in plain words, send a PDF, "
                         "Word file or photo (a caption like 'OM syllabus' helps). Commands are listed below.",
-                kind="info", attach=COMMANDS)
+                kind="info", attach=COMMANDS if users.is_owner(update.effective_user.id) else USER_COMMANDS)
 
 
 async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -453,6 +622,9 @@ async def _deliver_brief(bot, user_id, day, v: View) -> None:
 async def connect_google_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Run Google's sign-in in the browser on this computer and save the token."""
     log_message("in", update, inbound_text(update))
+    if not users.is_owner(update.effective_user.id):
+        await reply(update, agent.COMING_SOON)
+        return
     if not gaccount.CLIENT_FILE.exists():
         await reply(update, "credentials.json is missing from the project, so I can't start the Google login.")
         return
@@ -469,6 +641,9 @@ async def connect_google_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def inbox_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
+    if not users.is_owner(update.effective_user.id):
+        await reply(update, agent.COMING_SOON)
+        return
     await send_view(context.bot, update.effective_chat.id, inbox.inbox_view(update.effective_user.id))
 
 
@@ -489,6 +664,9 @@ async def voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/email alerts on|off, /email quiet (brief only)"""
     log_message("in", update, inbound_text(update))
+    if not users.is_owner(update.effective_user.id):
+        await reply(update, agent.COMING_SOON)
+        return
     user_id = update.effective_user.id
     args = [a.lower() for a in context.args]
     if args[:1] == ["quiet"]:
@@ -504,6 +682,9 @@ async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def actions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
+    if not users.is_owner(update.effective_user.id):
+        await reply(update, agent.COMING_SOON)
+        return
     await send_view(context.bot, update.effective_chat.id, actions.log_view(update.effective_user.id))
 
 
@@ -512,6 +693,9 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     log_message("in", update, inbound_text(update))
     user_id = update.effective_user.id
     args = [a.lower() for a in context.args]
+    if not users.is_owner(user_id):
+        await reply(update, agent.COMING_SOON)
+        return
     if len(args) == 2 and args[0] == "calendar" and args[1] in ("auto", "ask"):
         actions.set_calendar_mode(user_id, args[1])
         await reply(update, "Got it. I'll add low-risk calendar events without asking (they still show up in /actions)."
@@ -572,6 +756,11 @@ _SAY_IT = re.compile(r"^\s*(say (that|it) out loud|read (that|it) (out|to me)|se
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, rows: list[int]) -> None:
     user_id = update.effective_user.id
+    try:
+        users.spend(user_id, "messages")
+    except users.LimitReached as e:
+        await reply(update, str(e))
+        return
     await update.effective_chat.send_action(ChatAction.TYPING)
     was_voice = _voice_note.get() is not None
     _speak.set({"done": False} if speech.wants_voice(user_id, was_voice) else None)
@@ -588,10 +777,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
     # Conversations in progress about the profile take the message first.
     if onboarding.is_active(user_id):
         set_classification(rows, "onboarding")
+        which = onboarding.flow(user_id)
         draft, attach, finished = await _with_typing(update, context, onboarding.handle(user_id, text))
-        await speak(update, draft, kind="question", user_message=text, attach=attach)
+        await speak(update, draft, kind="question", user_message=feeds.redact(text), attach=attach)
         if finished:
             context.application.create_task(sync_profile(user_id))
+            if which in ("welcome", "calendars"):
+                await send_view(context.bot, update.effective_chat.id, views.week_view(user_id))
+                context.application.create_task(brain.connect(user_id))
+        return
+    # A pasted calendar link is a secret: handle it here, never in the agent.
+    if await _paste_feed(update, context, text):
+        set_classification(rows, "calendar_link")
         return
     m = selfmodel.meta(user_id)
     if m.get("awaiting_edit"):
@@ -830,13 +1027,19 @@ async def _email_button(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         await reply(update, "Updated your schedule:\n" + "\n".join(f"• {t}" for t in told) if told
                     else "That's already on your schedule.")
         for item_id in new_ids[:3]:
-            it = schedule.get_item(item_id)
+            it = schedule.get_item(item_id, user_id)
             if it:
                 try:
                     a = actions.propose(user_id, "calendar_add", actions.calendar_from_item(it), it.title, "email")
                     await offer_card(context.bot, chat_id, user_id, a.id)
                 except actions.Refused:
                     pass
+    elif op == "undo":
+        done = inbox.undo_items(user_id, ref)
+        await reply(update, "Undone:\n" + "\n".join(f"• {t}" for t in done) if done else "Nothing left to undo there.")
+    elif op == "ignore":
+        inbox.dismiss_items(user_id, ref)
+        await reply(update, "Ignored. I won't add it.")
     elif op == "ok":
         await reply(update, "👍")
     elif op in ("snooze1", "wait3"):
@@ -870,6 +1073,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Toggling inside /week edits the message; "Full week" from the brief sends a new one.
         await send_view(context.bot, update.effective_chat.id, v,
                         edit_message=None if len(parts) > 2 else q.message)
+    elif (data == "inbox" or data.startswith(("em:", "act:", "draft:"))) and not users.is_owner(user_id):
+        await reply(update, agent.COMING_SOON)
     elif data == "inbox":
         await send_view(context.bot, update.effective_chat.id, inbox.inbox_view(user_id))
     elif data == "events":
@@ -890,7 +1095,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _, op, action_id = data.split(":", 2)
         if op == "edit":
             a = actions.get(action_id)
-            if a is None or a.status != "pending":
+            if a is None or a.status != "pending" or a.user_id != str(user_id):
                 await reply(update, "That card isn't open anymore.")
                 return
             selfmodel.set_meta(user_id, awaiting_action_edit=action_id)
@@ -909,14 +1114,18 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                                          "Use what you know about the person. If you don't have their email address, ask me for it.")
         await _send_agent_reply(update, context, r)
     elif data.startswith("tx:"):
-        row = _db.execute("SELECT text FROM voice_transcripts WHERE token = ?", (data[3:],)).fetchone()
+        row = _db.execute("SELECT text FROM voice_transcripts WHERE token = ? AND user_id = ?", (data[3:], user_id)).fetchone()
         await send_view(context.bot, update.effective_chat.id, View(fmt.esc(row[0]) if row else "That text isn't around anymore."), speak=False)
     elif data.startswith("tr:"):
-        row = _db.execute("SELECT text FROM voice_transcripts WHERE token = ?", (data[3:],)).fetchone()
+        row = _db.execute("SELECT text FROM voice_transcripts WHERE token = ? AND user_id = ?", (data[3:], user_id)).fetchone()
         text = f"📝 <b>TRANSCRIPT</b>\n\n<i>{fmt.esc(row[0])}</i>" if row else "That transcript isn't around anymore."
         await send_view(context.bot, update.effective_chat.id, View(text))
     elif data.startswith("more:"):
-        pages = _more_pages.pop(data[5:], None)
+        chat, pages = _more_pages.get(data[5:], (None, None))
+        if chat != update.effective_chat.id:
+            pages = None
+        else:
+            _more_pages.pop(data[5:], None)
         if not pages:
             await speak(update, "That list expired. Ask again and you'll get a fresh one.", kind="error")
             return
@@ -1120,6 +1329,11 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     kind="error", user_message=inbound_text(update))
         return
 
+    try:
+        users.spend(user_id, "documents")
+    except users.LimitReached as e:
+        await reply(update, str(e))
+        return
     await update.effective_chat.send_action(ChatAction.TYPING)
     user_dir = FILES_DIR / str(user_id)
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -1151,6 +1365,11 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     media = msg.voice or msg.audio or msg.video_note
     user_id = update.effective_user.id
     duration = getattr(media, "duration", 0) or 0
+    try:
+        users.spend(user_id, "voice_minutes", round(max(duration, 1) / 60, 2))
+    except users.LimitReached as e:
+        await reply(update, str(e))
+        return
     if duration > transcribe.MAX_SECONDS:
         log_message("in", update, f"[voice {duration}s, too long]")
         await speak(update, f"That note is {duration // 60} minutes long; you can take up to 5. Ask him for a "
@@ -1216,6 +1435,9 @@ async def send_reminders(app: Application) -> None:
             schedule.ensure_class_reminders()
             now = datetime.now(schedule.TZ)
             for user_id, item, lead in schedule.pop_due_reminders(now, quiet_until=selfmodel.quiet_until):
+                if not users.is_active(user_id):
+                    continue  # blocked or gone: their reminders are dropped, never sent
+                users.acting.set(str(user_id))
                 v = await assistant.reminder_message(user_id, item, lead, now, recent_replies(user_id))
                 await send_view(app.bot, int(user_id), v)
         except Exception:
@@ -1226,11 +1448,11 @@ async def send_reminders(app: Application) -> None:
 async def sync_feeds(app: Application) -> None:
     """Sync Brightspace and Google Calendar now and every 3 hours. Never logs feed URLs."""
     while True:
-        results = await feeds.sync_all()
-        if any(not isinstance(r, str) and r.added for r in results.values()):
-            app.create_task(brain.connect(feeds.calendar_user()))
-        # Clean up new or changed titles once ("30 Min Meeting between ..." -> "Meeting with ...").
-        await schedule.normalize_titles(owner=selfmodel.owner_name(feeds.calendar_user()) if feeds.calendar_user() else None)
+        for user_id, results in (await feeds.sync_all()).items():
+            if any(not isinstance(r, str) and r.added for r in results.values()):
+                app.create_task(brain.connect(user_id))
+            # Clean up new or changed titles once ("30 Min Meeting between ..." -> "Meeting with ...").
+            await schedule.normalize_titles(user_id, owner=selfmodel.owner_name(user_id))
         await asyncio.sleep(feeds.SYNC_EVERY.total_seconds())
 
 
@@ -1239,12 +1461,12 @@ async def profile_loop(app: Application) -> None:
     the weekly reflection, once per user, with its first question sent as a message."""
     while True:
         await asyncio.sleep(15 * 60)
-        for user_id in selfmodel.all_user_ids():
+        for user_id in users.active_ids():
             await sync_profile(user_id)
         now = datetime.now(schedule.TZ)
         if now.weekday() == 6 and now.hour >= 18:
-            for user_id in selfmodel.all_user_ids():
-                if not user_id.isdigit() or selfmodel.meta(user_id).get("last_reflection") == now.date().isoformat():
+            for user_id in users.active_ids():
+                if selfmodel.meta(user_id).get("last_reflection") == now.date().isoformat():
                     continue
                 try:
                     draft, attach = await run_reflection(user_id)
@@ -1262,7 +1484,7 @@ async def email_loop(app: Application) -> None:
     while True:
         now = datetime.now(schedule.TZ)
         # One Google connection, and it belongs to the owner: never read it on anyone else's behalf.
-        for user_id in [u for u in [feeds.calendar_user()] if u]:
+        for user_id in [u for u in users.active_ids() if users.is_owner(u)]:
             try:
                 if not gaccount.connected():
                     continue
@@ -1302,17 +1524,26 @@ async def _after_sync(app: Application, user_id, since: str, first: bool) -> Non
     """New mail: deadlines and changes onto the schedule (telling him), calendar cards for new ones,
     and important facts into memory."""
     rows = inbox._db.execute("SELECT id FROM emails WHERE user_id = ? AND classified_at >= ? AND mine = 0", (str(user_id), since)).fetchall()
-    told_all, cards = [], 0
+    cards, suggested = 0, 0
     for r in rows:
         e = inbox.get_email(r["id"])
         if e is None:
             continue
         inbox.remember_important(user_id, e)
         if e.items and not e.applied and (datetime.now(timezone.utc) - e.date) < timedelta(days=inbox.FIRST_SYNC_DAYS):
+            if not inbox.trusted_sender(user_id, e):
+                # Not NYU, not a professor, not someone they know: ask, never change the schedule on its own.
+                if suggested < 3 and any(i.get("date") for i in e.items):
+                    suggested += 1
+                    await send_view(app.bot, int(user_id), inbox.suggestion_view(e))
+                continue
             told, new_ids = inbox.apply_items(user_id, e)
-            told_all += told
+            if told:
+                await send_view(app.bot, int(user_id), View(
+                    "📅 <b>FROM YOUR EMAIL</b>\n" + "\n".join(f"• {fmt.esc(t)}" for t in told[:6]),
+                    [[("↩️ Undo", f"em:undo:{e.id}")]]))
             for item_id in new_ids:
-                it = schedule.get_item(item_id)
+                it = schedule.get_item(item_id, user_id)
                 if it and cards < 3 and it.due_date and it.due_date >= datetime.now(schedule.TZ).date():
                     try:
                         a = actions.propose(user_id, "calendar_add", actions.calendar_from_item(it), it.title, "email")
@@ -1320,15 +1551,13 @@ async def _after_sync(app: Application, user_id, since: str, first: bool) -> Non
                         await offer_card(app.bot, int(user_id), user_id, a.id)
                     except actions.Refused:
                         pass
-    if told_all:
-        await send_view(app.bot, int(user_id), fmt.view("📅 <b>FROM YOUR EMAIL</b>\n" + "\n".join(f"• {fmt.esc(t)}" for t in told_all[:8])))
     if rows:
         app.create_task(brain.connect(user_id))
 
 
 def event_users() -> list[str]:
-    ids = {feeds.calendar_user()} | {u for u in selfmodel.all_user_ids() if u.isdigit()}
-    return sorted(u for u in ids if u)
+    """Background jobs (events, briefs) run for active users only, each with only their own data."""
+    return users.active_ids()
 
 
 async def events_loop(app: Application) -> None:
@@ -1342,11 +1571,13 @@ async def events_loop(app: Application) -> None:
                 last_fetch = now
                 await events.refresh(now)
                 for user_id in event_users():
+                    users.acting.set(user_id)
                     await events.score_new(user_id, now)
             if events.DELIVERY_TIME <= now.time() < events.DELIVERY_UNTIL:
                 for user_id in event_users():
                     if events.picked_today(user_id, now.date()) or selfmodel.quiet_until(user_id, now):
                         continue
+                    users.acting.set(user_id)
                     picks = events.picks_for_day(user_id, now.date())
                     v = await assistant.picks_message(user_id, picks, now, recent_replies(user_id)) if picks else None
                     events.record_picks(user_id, now.date(), picks, v.plain if v else None)
@@ -1364,6 +1595,7 @@ async def brief_loop(app: Application) -> None:
     while True:
         now = datetime.now(schedule.TZ)
         for user_id in event_users():
+            users.acting.set(user_id)
             try:
                 kind = brief.due(user_id, now)
                 if kind == "daily":
@@ -1398,6 +1630,7 @@ async def warm_loop(app: Application) -> None:
 
 
 async def post_init(app: Application) -> None:
+    users.bootstrap()
     await brain.start()  # Cognee Cloud: connect on this loop before any memory operation
     n = actions.expire_stale_sends()  # a send cut off by a restart never goes out late
     if n:
@@ -1421,13 +1654,23 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
-def build_app(token: str) -> Application:
-    app = (
-        Application.builder().token(token).concurrent_updates(True).post_init(post_init)
-        .connect_timeout(20).read_timeout(30).get_updates_connect_timeout(20).get_updates_read_timeout(40)
-        .build()
-    )
+def build_app(token: str, bot=None) -> Application:
+    """The application with every handler. Tests pass their own bot (which records instead of sending)."""
+    builder = Application.builder().concurrent_updates(True).post_init(post_init)
+    if bot is not None:
+        builder = builder.bot(bot)
+    else:
+        builder = (builder.token(token).connect_timeout(20).read_timeout(30)
+                   .get_updates_connect_timeout(20).get_updates_read_timeout(40))
+    app = builder.build()
+    app.add_handler(TypeHandler(Update, gate), group=-1)  # access control before everything else
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("connect", connect_cmd))
+    app.add_handler(CommandHandler("invite", invite_cmd))
+    app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("block", block_cmd))
+    app.add_handler(CommandHandler("unblock", unblock_cmd))
+    app.add_handler(CommandHandler("usage", usage_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("week", week_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))

@@ -27,9 +27,9 @@ Types:
 - "question": he wants information back. Includes questions without a question mark and
   commands like "show me tuesday", "who is hena", "what work do i have next week", "list my exams".
 - "schedule": he's telling you about something with a date or time to track: a deadline,
-  exam, class, meeting or event ("Chewy draft due next Friday 11:59pm", "OM exam on Oct 12").
+  exam, class, meeting or event ("marketing draft due next Friday 11:59pm", "stats exam on Oct 12").
 - "memory": a fact, person, idea or note to keep with nothing to schedule
-  ("Met Sam at the Leslie mixer, he builds climate tools").
+  ("Met Dana at the design mixer, she builds climate tools").
 - "correction": he's correcting something about himself or something you said:
   "I am X", "my name is X", "actually ...", "no, ...", "that's wrong, ...", "bro, i am chirag".
 
@@ -227,7 +227,7 @@ async def correct(user_id, text: str, last_reply: str | None = None, recent: lis
 
 CONTEXT_TASK = """Write ONE short line (max 12 words) for a reminder about {what}. Only facts below.
 Most useful first: a teammate or group deliverable for this course, then the next deadline.
-Say deadlines like a person ("your Chewy section is due Friday"). If nothing useful, return: none
+Say deadlines like a person ("your marketing section is due Friday"). If nothing useful, return: none
 
 Coming up for this course: {upcoming}
 What you know about it: {memory}"""

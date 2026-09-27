@@ -17,6 +17,7 @@ from pathlib import Path
 
 import brain  # the only module that touches Cognee
 import llm
+import paths
 from schedule import TZ
 
 log = logging.getLogger("selfmodel")
@@ -30,7 +31,7 @@ SINGLE_KEYS = {"name", "location", "school", "year", "reply_style", "reminder_ti
 SOURCES = {"onboarding", "chat", "document", "calendar", "inferred"}
 CORE_NODE_SET = ["core_profile"]
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "violet.db"
+DB_PATH = paths.VIOLET_DB
 _db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
 _db.row_factory = sqlite3.Row
 _db.execute(
@@ -405,7 +406,7 @@ def format_profile(user_id) -> str:
 FACT_SCHEMA = """Each fact: {{"section": one of {sections}, "text": a short phrase about the user that starts
 with a verb and never with their name, "I" or "my" (e.g. "Studies MS Management of Technology at
 NYU Tandon", "Wants a PM role at a climate tech startup", "Prefers short replies"). For a person,
-start with their name ("Hena: teammate in Operations Management"). "attrs": {{...}}}}.
+start with their name ("Omar: teammate in Statistics"). "attrs": {{...}}}}.
 Put each fact in one section only: program and courses go in academics, not identity.
 Keep names of projects, companies and people ("Building Voltly, an app that ...").
 attrs keys:
@@ -430,7 +431,7 @@ Return JSON: {{"facts": [...]}}. Empty list if the answer has nothing usable."""
 LEARN_PROMPT = """Does this message reveal a LASTING fact about the user (who they are, their program or
 courses, goals, projects, the people in their life and their role, preferences, routines)?
 Regular routines count as lasting ("every Thursday", "usually", "on weekends"): put them in patterns
-(kind routine), e.g. "Meets Hena on Thursday evenings to work on the OM project".
+(kind routine), e.g. "Meets Omar on Thursday evenings to work on the stats project".
 Ignore one-off details (a single deadline, today's plans, a mood, an errand, a question they ask).
 Only return facts that are NEW or CHANGE what we already know; never repeat a known fact.
 Other people's names in the message are other people, never the user. Only give the user a name
@@ -485,7 +486,7 @@ Their calendar this week and next:
 
 1. Patterns: lasting routines, busy days, recurring topics you can see (max 4). Skip anything
    already in the profile. Write each as a short phrase starting with a verb, never with their
-   name ("Meets Hena on Thursday evenings", "Has most deadlines on Fridays"). {sensitive}
+   name ("Meets Omar on Thursday evenings", "Has most deadlines on Fridays"). {sensitive}
 2. Up to 2 short yes/no questions to confirm the most useful "I noticed" facts (ids from the
    profile marked inferred, or from your new patterns as "new:N" by index).
 

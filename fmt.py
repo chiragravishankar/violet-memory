@@ -76,7 +76,7 @@ def time_line(when: str, title: str, icon: str = "") -> str:
 
 
 def sub(*parts: str | None) -> str | None:
-    """"↳ 2 MetroTech · Prof. Jacoby", or None if every part is empty."""
+    """"↳ Bobst · Prof. Kim", or None if every part is empty."""
     seen, out = set(), []
     for p in parts:
         if p and p.strip().lower() not in seen:

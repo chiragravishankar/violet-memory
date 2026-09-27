@@ -29,6 +29,7 @@ import brain
 import fmt
 import gaccount
 import llm
+import paths
 import schedule
 import selfmodel
 import voice
@@ -47,7 +48,7 @@ CLASSIFY_BATCH = 12
 SKIP_LABELS = {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "SPAM", "TRASH"}
 _NOREPLY = re.compile(r"no-?reply|do-?not-?reply|notifications?@|mailer-daemon|bounce|updates@|news(letter)?@", re.I)
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "violet.db"
+DB_PATH = paths.VIOLET_DB
 _db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
 _db.row_factory = sqlite3.Row
 _db.executescript("""
@@ -77,7 +78,23 @@ CREATE TABLE IF NOT EXISTS email_nudges (
     PRIMARY KEY (user_id, thread_id, kind)
 );
 """)
+if "undo" not in {r[1] for r in _db.execute("PRAGMA table_info(emails)")}:
+    _db.execute("ALTER TABLE emails ADD COLUMN undo TEXT")  # JSON: what apply_items changed, to undo it
 _db.commit()
+
+# Senders whose emails may change the schedule on their own (always announced, with Undo). Anyone
+# else only gets a suggestion card. Email content is untrusted either way.
+TRUSTED_DOMAINS = ("nyu.edu", "d2l.com", "brightspace.com")
+
+
+def trusted_sender(user_id, e: "Email") -> bool:
+    """NYU addresses (and NYU systems like Brightspace), and people in the user's people store
+    (which includes their professors)."""
+    addr = (e.from_addr or "").lower()
+    domain = addr.rsplit("@", 1)[-1]
+    if any(domain == d or domain.endswith("." + d) for d in TRUSTED_DOMAINS):
+        return True
+    return bool(_match_person(user_id, addr, e.from_name or ""))
 
 
 def _now() -> datetime:
@@ -442,6 +459,32 @@ def _replied_after(user_id, thread_id: str, after: datetime) -> bool:
     return bool(r)
 
 
+_thread_starter: dict[str, bool] = {}  # thread id -> started by the user (cache)
+
+
+async def _is_reply_to_user(user_id, r, me: str) -> bool:
+    """True if this email is a reply in a thread the user started: the thread's first message is theirs
+    and this one came after it. Uses synced mail, else asks Gmail for the thread's first sender."""
+    tid = r["thread_id"]
+    if tid not in _thread_starter:
+        first = _db.execute("SELECT mine, date FROM emails WHERE user_id = ? AND thread_id = ? ORDER BY date LIMIT 1",
+                            (str(user_id), tid)).fetchone()
+        started = None
+        if first is not None and first["mine"]:
+            started = True
+        else:
+            try:
+                t = await asyncio.to_thread(lambda: _svc().users().threads().get(
+                    userId="me", id=tid, format="metadata", metadataHeaders=["From"]).execute())
+                msgs = t.get("messages") or []
+                hdr = {h["name"].lower(): h["value"] for h in (msgs[0].get("payload", {}).get("headers") or [])} if msgs else {}
+                started = bool(me) and me.lower() in hdr.get("from", "").lower()
+            except Exception:
+                started = bool(first is not None and first["mine"])
+        _thread_starter[tid] = started
+    return bool(_thread_starter[tid]) and not r["mine"]
+
+
 def _someone_replied_after(user_id, thread_id: str, after: datetime) -> bool:
     r = _db.execute("SELECT 1 FROM emails WHERE user_id = ? AND thread_id = ? AND mine = 0 AND date > ?",
                     (str(user_id), thread_id, after.isoformat())).fetchone()
@@ -533,7 +576,7 @@ def apply_items(user_id, e: Email) -> tuple[list[str], list[str]]:
     """Put an email's deadlines and events on the schedule (source "email"), updating an existing item
     when the email changes its date instead of adding a duplicate. Returns (lines to tell him, new ids).
     Internal schedule only: anything outward (Google Calendar) is a proposal card."""
-    told, new_ids = [], []
+    told, new_ids, undo = [], [], []
     if e.applied:
         return told, new_ids
     for it in e.items:
@@ -549,6 +592,8 @@ def apply_items(user_id, e: Email) -> tuple[list[str], list[str]]:
             if existing:
                 x = existing[0]
                 old = schedule.fmt_due(x)
+                undo.append({"op": "move", "item_id": x.id, "date": x.due_date.isoformat() if x.due_date else None,
+                             "time": x.due_time.strftime("%H:%M") if x.due_time else None})
                 schedule.update_due(x.id, d, t or x.due_time)
                 told.append(f"{x.shown}: moved from {old} to {schedule.fmt_due(schedule.get_item(x.id))} (per {e.who})")
                 continue
@@ -561,9 +606,42 @@ def apply_items(user_id, e: Email) -> tuple[list[str], list[str]]:
         for a in res.added:
             told.append(f"Added {a.title}, {schedule.fmt_due(a)}")
             new_ids.append(a.id)
-    _db.execute("UPDATE emails SET applied = 1 WHERE id = ?", (e.id,))
+            undo.append({"op": "add", "item_id": a.id})
+    _db.execute("UPDATE emails SET applied = 1, undo = ? WHERE id = ? AND user_id = ?", (json.dumps(undo), e.id, str(user_id)))
     _db.commit()
     return told, new_ids
+
+
+def undo_items(user_id, email_id: str) -> list[str]:
+    """Reverse what apply_items did for this email: remove added items, move changed ones back."""
+    r = _db.execute("SELECT undo FROM emails WHERE id = ? AND user_id = ?", (email_id, str(user_id))).fetchone()
+    done = []
+    for u in json.loads((r["undo"] if r else None) or "[]"):
+        it = schedule.get_item(u["item_id"], user_id)
+        if it is None:
+            continue
+        if u["op"] == "add" and schedule.remove_item(user_id, it.id):
+            done.append(f"Removed {it.shown}")
+        elif u["op"] == "move" and u.get("date"):
+            schedule.update_due(it.id, date.fromisoformat(u["date"]), schedule._parse_time(u["time"]) if u.get("time") else None)
+            done.append(f"{it.shown} is back to {schedule.fmt_due(schedule.get_item(it.id, user_id))}")
+    _db.execute("UPDATE emails SET undo = NULL WHERE id = ? AND user_id = ?", (email_id, str(user_id)))
+    _db.commit()
+    return done
+
+
+def dismiss_items(user_id, email_id: str) -> None:
+    """The user said Ignore to an email's suggested deadline: never suggest or apply it again."""
+    _db.execute("UPDATE emails SET applied = 1 WHERE id = ? AND user_id = ?", (email_id, str(user_id)))
+    _db.commit()
+
+
+def suggestion_view(e: "Email") -> View:
+    """A deadline in an email from someone not trusted: ask before it goes on the schedule."""
+    its = [i for i in e.items if i.get("date") and i.get("type") in ("deadline", "change", "event", "meeting", "task")]
+    what = "; ".join(f"{i.get('title') or e.subject} ({i['date']}{' ' + i['time'] if i.get('time') else ''})" for i in its[:3])
+    return View(f"📬 This email mentions a deadline: <b>{fmt.esc(what)}</b>\n↳ From {fmt.esc(e.who)}: "
+                f"{fmt.esc(e.subject[:80])}\nAdd it?", [[("✅ Add", f"em:sched:{e.id}"), ("✖ Ignore", f"em:ignore:{e.id}")]])
 
 
 def remember_important(user_id, e: Email) -> None:
@@ -637,7 +715,7 @@ Return JSON: {{"subject": "...", "body": "..."}}"""
 
 async def draft_reply(user_id, email_id: str, nudge: bool = False) -> actions.Action:
     """Propose a reply (or a follow-up nudge) in the same thread, as an approval card."""
-    r = _db.execute("SELECT * FROM emails WHERE id = ?", (email_id,)).fetchone()
+    r = _db.execute("SELECT * FROM emails WHERE id = ? AND user_id = ?", (email_id, str(user_id))).fetchone()
     if r is None:
         raise actions.Refused("I can't find that email anymore.")
     to_addr = (r["to_addrs"] or "").split(", ")[0] if nudge else r["from_addr"]
@@ -734,5 +812,7 @@ async def search(user_id, query: str, days: int = 14) -> list[dict]:
         if not r["mine"]:
             item["needs_reply"] = bool(r["needs_reply"])
             item["he_replied"] = _replied_after(user_id, r["thread_id"], datetime.fromisoformat(r["date"]))
+            # "did X reply?" is literal: yes only for a reply in a thread the user started.
+            item["is_reply_to_your_email"] = await _is_reply_to_user(user_id, r, me)
         out.append(item)
     return out

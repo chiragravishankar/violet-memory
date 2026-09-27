@@ -27,6 +27,7 @@ import base64
 import fmt
 import gaccount
 import llm
+import paths
 import schedule
 import selfmodel
 from fmt import View, esc
@@ -39,8 +40,8 @@ SEND_DELAY = 10  # seconds between tapping Send and the email leaving, with Undo
 MAX_EMAILS_PER_DAY = 10
 MARKER = "Added by Violet"  # in descriptions of events Violet creates (the iCal feed carries it)
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "violet.db"
-MSG_DB = Path(__file__).resolve().parent / "data" / "messages.db"
+DB_PATH = paths.VIOLET_DB
+MSG_DB = paths.MESSAGES_DB
 _db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
 _db.row_factory = sqlite3.Row
 _db.executescript("""
@@ -218,7 +219,11 @@ def get(action_id: str) -> Action | None:
 
 
 def propose(user_id, type_: str, payload: dict, summary: str, origin: str = "agent") -> Action:
-    """Store a pending proposal (after the hard limits). Nothing is executed here."""
+    """Store a pending proposal (after the hard limits). Nothing is executed here. Actions touch the
+    owner's Google account, so only the owner can have them (for now)."""
+    import users
+    if not users.is_owner(user_id):
+        raise Refused("Email and Google Calendar actions are coming soon. For now they're owner-only.")
     p = validate(user_id, type_, dict(payload))
     now = _now()
     a = Action(secrets.token_hex(5), str(user_id), type_, p, fmt.nodash(summary)[:200] or type_, "pending")
@@ -311,9 +316,8 @@ async def approve(user_id, action_id: str, op: str, via: str) -> Outcome:
         return Outcome("That button doesn't fit this card.")
     if via not in ("button", "text", "setting") or (via == "setting" and a.type != "calendar_add"):
         return Outcome("Only you can approve this.")
-    import os
-    owner = os.getenv("CALENDAR_USER_ID") or os.getenv("GOOGLE_ICS_USER_ID")
-    if owner and str(user_id) != str(owner):
+    import users
+    if not users.is_owner(user_id):
         return Outcome("Only the account owner can approve actions on the connected Google account.")
     target = "sending" if (a.type == "email" and op == "send") else "executing"
     if a.type == "email" and op == "send" and emails_sent_today(user_id) >= MAX_EMAILS_PER_DAY:
