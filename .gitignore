@@ -11,3 +11,7 @@ token.json
 openclaw/runtime/node_modules/
 openclaw/runtime/.npm-cache/
 openclaw/state/
+
+# ClawMax tunnel runtime state (pid, URL, log)
+clawmax/.tunnel/
+clawmax/cloudflared.yml

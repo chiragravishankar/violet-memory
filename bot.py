@@ -23,6 +23,7 @@ import agent
 import assistant
 import brain  # loads .env
 import brief
+import clawmax
 import delivered
 import docs
 import events
@@ -757,6 +758,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.effective_message.text
     user_id = update.effective_user.id
     row = log_message("in", update, _FEED_URL.sub("<feed url>", text))
+    if clawmax.serves(update.effective_chat.id):
+        # ClawMax sends one whole message per request and waits for the answer: no split-message wait.
+        await handle_text(update, context, text, [row])
+        return
     await update.effective_chat.send_action(ChatAction.TYPING)
     buf = _buffers.setdefault(user_id, {"parts": [], "rows": []})
     buf["parts"].append(text)
@@ -793,7 +798,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
         return
     await update.effective_chat.send_action(ChatAction.TYPING)
     was_voice = _voice_note.get() is not None
-    _speak.set({"done": False} if speech.wants_voice(user_id, was_voice) else None)
+    _speak.set({"done": False} if speech.wants_voice(user_id, was_voice) and not clawmax.serves(update.effective_chat.id)
+               else None)  # the ClawMax path is text only
     if _SAY_IT.match(text):
         last = last_reply(user_id)
         set_classification(rows, "say_it")
@@ -1731,6 +1737,7 @@ async def warm_loop(app: Application) -> None:
 
 async def post_init(app: Application) -> None:
     users.bootstrap()
+    await clawmax.start(build_app)  # the owner's ClawMax endpoint (localhost only), if VIOLET_CLAWMAX_TOKEN is set
     users.fill_names(selfmodel.owner_name)
     for uid in users.active_ids():
         try:
