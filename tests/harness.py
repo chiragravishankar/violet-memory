@@ -69,7 +69,11 @@ class FakeCognee:
         return uuid.UUID(self.ids[name])
 
     def touched(self) -> set[str]:
-        return {d for _, d in self.calls}
+        """Datasets touched, ignoring reads of shared knowledge (nyu_knowledge is readable by everyone)."""
+        return {d for op, d in self.calls if not (op == "recall" and d == "nyu_knowledge")}
+
+    def shared_writes(self) -> list:
+        return [(op, d) for op, d in self.calls if d == "nyu_knowledge" and op != "recall"]
 
 
 def install_fake_cognee(brain) -> FakeCognee:

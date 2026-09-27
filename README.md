@@ -306,3 +306,52 @@ people in the people store, which includes professors. Anyone else gets an "Add 
 - `tests/demo_multiuser.py new`: a new user from invite code to first `/week`.
 - `tests/demo_multiuser.py real`: the friend and the owner on real data, with the test turns
   cleaned up afterwards.
+
+## NYU Helper
+
+Violet answers NYU questions and helps resolve them. Every answer ends with its source links, and says
+how recent they are when that matters.
+
+**Knowledge base (shared by everyone).**
+- `nyu_kb.py` crawls the public NYU sites listed in `config/nyu_sources.json` (edit freely).
+- The crawl respects robots.txt and crawl-delay, sends a clear User-Agent, waits 2 s between requests,
+  goes at most 3 links deep, and caps pages per source.
+- Page text goes into a local full-text index (fast lookups with exact URLs) and into the shared Cognee
+  Cloud dataset `nyu_knowledge`. That dataset is separate from every user's private dataset, and only
+  the crawler writes to it.
+- It refreshes weekly (`nyu_loop` in the bot, or run `scripts/nyu_crawl.py`).
+- **www.nyu.edu refuses crawlers** (HTTP 403), so Violet doesn't crawl it. Those topics (OGS,
+  Registrar, Bursar, Health, Housing, IT, transit, NYU Card) come from the live search below.
+
+**Live search (fallback).** When the knowledge base isn't confident, Violet runs OpenAI's `web_search`
+tool restricted to `nyu.edu` (`filters.allowed_domains`). It uses the same `LLM_API_KEY`; no other
+key is needed.
+
+**Offices.** `config/nyu_offices.json` lists the official contact for each office, every detail with
+an nyu.edu source. `scripts/nyu_offices_refresh.py` rebuilds it. Email cards may use these addresses.
+
+**Professors.** `find_professor` looks in the user's own documents, their mail (owner only), and NYU
+faculty pages that it fetches and checks. It shows where each email came from, never guesses or builds
+an address, and saves what it finds on the professor's entry in the people store.
+
+**Study rooms.** `libcal.py` reads nyu.libcal.com without logging in and never books.
+- Room lists come from `/spaces?lid=…`, availability from `POST /spaces/availability/grid`, cached for
+  5 minutes, with requests at least 10 s apart per robots.txt.
+- Replies give a deep link to `/space/<room>?date=…`, where the student picks the time, signs in with
+  their NetID and confirms.
+- Dibner is the default. The library's booking rules are built in.
+- `add_study_room_reminder` puts the room on the schedule with a 15-minute reminder.
+
+**Library hours.** Today's hours and "open now" come from the LibCal hours feed.
+
+**Safety.**
+- Violet never asks for or accepts a password. A message containing one is refused, redacted from the
+  log, and never reaches the model.
+- On immigration, health, legal and financial aid questions, Violet gives the official information and
+  the right office, never personal advice.
+
+**Tools:** `nyu_search`, `nyu_office`, `find_professor`, `find_study_room`, `library_hours`,
+`add_study_room_reminder`.
+
+**Test:** `tests/nyu_live_demo.py` sends the test questions through the real handlers, and Violet's
+replies arrive in the owner's Telegram.

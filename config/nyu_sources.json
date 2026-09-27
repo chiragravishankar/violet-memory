@@ -1,0 +1,160 @@
+{
+ "_about": "Public NYU sites Violet crawls into the shared nyu_knowledge dataset (weekly). Edit freely: each source has start URLs, the URL prefixes the crawler may follow, and a page cap. Depth is at most 3 links from a start URL. The crawler respects robots.txt, identifies itself, and waits between requests.",
+ "max_depth": 3,
+ "delay_seconds": 2.0,
+ "refresh_days": 7,
+ "sources": [
+  {
+   "name": "NYU students hub",
+   "start": [
+    "https://www.nyu.edu/students.html"
+   ],
+   "allow": [
+    "https://www.nyu.edu/students"
+   ],
+   "max_pages": 60
+  },
+  {
+   "name": "Tandon School of Engineering",
+   "start": [
+    "https://engineering.nyu.edu/academics",
+    "https://engineering.nyu.edu/student-life"
+   ],
+   "allow": [
+    "https://engineering.nyu.edu/academics",
+    "https://engineering.nyu.edu/student-life",
+    "https://engineering.nyu.edu/about/campus"
+   ],
+   "max_pages": 50
+  },
+  {
+   "name": "Stern School of Business",
+   "start": [
+    "https://www.stern.nyu.edu/programs-admissions",
+    "https://www.stern.nyu.edu/portal-partners/current-students"
+   ],
+   "allow": [
+    "https://www.stern.nyu.edu/programs-admissions",
+    "https://www.stern.nyu.edu/portal-partners/current-students"
+   ],
+   "max_pages": 30
+  },
+  {
+   "name": "NYU Libraries",
+   "start": [
+    "https://library.nyu.edu/services/",
+    "https://library.nyu.edu/locations/"
+   ],
+   "allow": [
+    "https://library.nyu.edu/services",
+    "https://library.nyu.edu/locations",
+    "https://library.nyu.edu/spaces"
+   ],
+   "max_pages": 40
+  },
+  {
+   "name": "Office of Global Services (international students)",
+   "start": [
+    "https://www.nyu.edu/students/student-information-and-resources/student-visa-and-immigration.html"
+   ],
+   "allow": [
+    "https://www.nyu.edu/students/student-information-and-resources/student-visa-and-immigration"
+   ],
+   "max_pages": 40
+  },
+  {
+   "name": "Wasserman Center for Career Development",
+   "start": [
+    "https://wasserman.nyu.edu/"
+   ],
+   "allow": [
+    "https://wasserman.nyu.edu/"
+   ],
+   "max_pages": 30
+  },
+  {
+   "name": "Registrar and academic calendar",
+   "start": [
+    "https://www.nyu.edu/students/student-information-and-resources/registration-records-and-graduation.html",
+    "https://www.nyu.edu/registrar/calendars/university-academic-calendar.html"
+   ],
+   "allow": [
+    "https://www.nyu.edu/students/student-information-and-resources/registration-records-and-graduation",
+    "https://www.nyu.edu/registrar"
+   ],
+   "max_pages": 40
+  },
+  {
+   "name": "Bursar (bills and payments)",
+   "start": [
+    "https://www.nyu.edu/students/student-information-and-resources/bills-payments-and-refunds.html"
+   ],
+   "allow": [
+    "https://www.nyu.edu/students/student-information-and-resources/bills-payments-and-refunds"
+   ],
+   "max_pages": 25
+  },
+  {
+   "name": "Student Health Center",
+   "start": [
+    "https://www.nyu.edu/students/health-and-wellness.html"
+   ],
+   "allow": [
+    "https://www.nyu.edu/students/health-and-wellness"
+   ],
+   "max_pages": 35
+  },
+  {
+   "name": "Housing and Dining",
+   "start": [
+    "https://www.nyu.edu/students/student-information-and-resources/housing-and-dining.html"
+   ],
+   "allow": [
+    "https://www.nyu.edu/students/student-information-and-resources/housing-and-dining"
+   ],
+   "max_pages": 30
+  },
+  {
+   "name": "NYU IT",
+   "start": [
+    "https://www.nyu.edu/life/information-technology.html"
+   ],
+   "allow": [
+    "https://www.nyu.edu/life/information-technology"
+   ],
+   "max_pages": 40
+  },
+  {
+   "name": "Leslie eLab and Entrepreneurial Institute",
+   "start": [
+    "https://entrepreneur.nyu.edu/"
+   ],
+   "allow": [
+    "https://entrepreneur.nyu.edu/"
+   ],
+   "max_pages": 25
+  },
+  {
+   "name": "NYU transportation and shuttles",
+   "start": [
+    "https://www.nyu.edu/life/travel-and-transportation.html"
+   ],
+   "allow": [
+    "https://www.nyu.edu/life/travel-and-transportation"
+   ],
+   "max_pages": 20
+  },
+  {
+   "name": "NYU Card (IDs) and campus services",
+   "start": [
+    "https://www.nyu.edu/life/campus-resources.html"
+   ],
+   "allow": [
+    "https://www.nyu.edu/life/campus-resources",
+    "https://www.nyu.edu/life/safety-health-wellness"
+   ],
+   "max_pages": 30
+  }
+ ],
+ "_note": "www.nyu.edu refuses crawlers (HTTP 403 for a crawler User-Agent), so sources on www.nyu.edu are skipped and those topics are answered by the live nyu.edu search instead. They stay listed here in case NYU allows it later."
+}

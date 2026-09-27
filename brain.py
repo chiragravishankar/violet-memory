@@ -912,3 +912,53 @@ async def _delete_items(uid: str, rows: list) -> None:
     db.executemany("DELETE FROM memory_outbox WHERE id=?", [(r[0],) for r in rows])
     db.commit()
     clear_cache(uid)
+
+
+# ---------- shared knowledge (not any user's memory) ----------
+
+SHARED_DATASETS = {"nyu_knowledge"}  # written only by background jobs (the NYU crawler), read by everyone
+
+
+def _shared(dataset: str) -> str:
+    if dataset not in SHARED_DATASETS:
+        raise ValueError("not a shared dataset")
+    return dataset
+
+
+async def shared_put(dataset: str, texts: list[str], replace_names: list[str] | None = None,
+                     wait: float = WRITE_WAIT) -> None:
+    """Add documents to a shared dataset, removing old versions (by content name) first."""
+    ds = _shared(dataset)
+    if not CLOUD or not connected():
+        raise RuntimeError("shared knowledge needs Cognee Cloud")
+    if replace_names:
+        try:
+            ds_id, items = await asyncio.wait_for(_cloud_items(ds), BACKGROUND_WAIT)
+            old = [d for d in items if Path(str(d.name)).stem in set(replace_names)]
+            for d in old:
+                await cognee.forget(data_id=d.id, dataset_id=ds_id)
+        except (asyncio.TimeoutError, Exception) as e:
+            log.info("shared: could not remove old versions (%s)", _safe(e))
+    await asyncio.wait_for(cognee.remember(texts, dataset_name=ds, self_improvement=False), wait)
+    _ok()
+
+
+async def shared_context(dataset: str, question: str, wait: float = INTERACTIVE_WAIT) -> str:
+    """What a shared dataset knows about the question (context, no answer written). "" on miss or timeout."""
+    ds = _shared(dataset)
+    if not CLOUD or not connected():
+        return ""
+    key = f"{ds}:{_qkey(question)}"
+    hit = _cache.get("_shared", {}).get(key)
+    if hit and time.monotonic() - hit[0] < CACHE_TTL:
+        return hit[1]
+    task = asyncio.ensure_future(cognee.recall(question, query_type=SearchType.GRAPH_COMPLETION, datasets=[ds],
+                                               only_context=True))
+    try:
+        text = _first_text(await asyncio.wait_for(asyncio.shield(task), wait))
+    except (asyncio.TimeoutError, Exception) as e:
+        log.info("shared recall on %s skipped (%s)", ds, _safe(e))
+        return ""
+    if text:
+        _cache.setdefault("_shared", {})[key] = (time.monotonic(), text)
+    return text

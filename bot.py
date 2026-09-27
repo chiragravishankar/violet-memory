@@ -163,8 +163,23 @@ def log_message(direction: str, update: Update, text: str | None, classification
     return log_raw(direction, user.id if user else None, chat.id if chat else None, text, classification)
 
 
+_PASSWORD = re.compile(r"(\b(?:pass ?word|passwd|pwd)\b\s*(?:is|was|:|=)\s*)(\S{4,})", re.I)
+_NOT_A_PASSWORD = re.compile(r"^(correct|wrong|incorrect|invalid|expired|locked|working|not|too|still|the|same|"
+                             r"different|required|needed|reset|changed|case)\W*$", re.I)
+
+
+def _shares_password(text: str) -> bool:
+    """Looks like someone typing a password ("my NetID password is ..."), not just talking about one."""
+    m = _PASSWORD.search(text or "")
+    return bool(m) and not _NOT_A_PASSWORD.match(m.group(2))
+
+
+def _hide_password(text: str) -> str:
+    return _PASSWORD.sub(lambda m: m.group(1) + ("[hidden]" if not _NOT_A_PASSWORD.match(m.group(2)) else m.group(2)), text)
+
+
 def log_raw(direction: str, user_id, chat_id, text: str | None, classification: str | None = None) -> int:
-    text = feeds.redact(text) if text else text  # calendar links are secrets: never stored
+    text = _hide_password(feeds.redact(text)) if text else text  # calendar links and passwords: never stored
     cur = _db.execute(
         "INSERT INTO messages (ts, direction, user_id, chat_id, text, classification) VALUES (?, ?, ?, ?, ?, ?)",
         (datetime.now(timezone.utc).isoformat(), direction, user_id, chat_id, text, classification),
@@ -785,6 +800,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
             if which in ("welcome", "calendars"):
                 await send_view(context.bot, update.effective_chat.id, views.week_view(user_id))
                 context.application.create_task(brain.connect(user_id))
+        return
+    # Never take a NetID (or any) password: don't pass it to the agent, memory or a model.
+    if _shares_password(text):
+        set_classification(rows, "password_refused")
+        it = next((o for o in __import__("nyu").offices() if "IT" in o.get("name", "")), {})
+        await reply(update, "Please don't send me your password, not even your NetID one: I never need it and I didn't "
+                            "keep that message. If you've shared it anywhere, change it now with NYU IT"
+                            + (f" ({it.get('email')}, {it.get('phone')})" if it.get("email") else "") + ".")
         return
     # A pasted calendar link is a secret: handle it here, never in the agent.
     if await _paste_feed(update, context, text):
@@ -1609,6 +1632,21 @@ async def brief_loop(app: Application) -> None:
         await asyncio.sleep(60)
 
 
+async def nyu_loop(app: Application) -> None:
+    """Refresh the shared NYU knowledge base weekly (polite crawl, then upload changed pages)."""
+    import nyu_kb
+
+    await asyncio.sleep(600)  # never right at startup
+    while True:
+        try:
+            if nyu_kb.due():
+                report = await nyu_kb.crawl()
+                log.info("nyu knowledge refreshed: %s", {k: v["pages"] for k, v in report.items()})
+        except Exception:
+            log.exception("nyu loop error")
+        await asyncio.sleep(6 * 3600)
+
+
 WARM_AHEAD = timedelta(minutes=4)
 
 
@@ -1643,6 +1681,7 @@ async def post_init(app: Application) -> None:
     app.create_task(brief_loop(app))
     app.create_task(email_loop(app))
     app.create_task(warm_loop(app))
+    app.create_task(nyu_loop(app))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

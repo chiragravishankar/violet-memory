@@ -301,6 +301,14 @@ async def main():
         bad = True
     check("a dataset name can't be forged from a user id", bad)
 
+    # ---------- secrets and shared knowledge ----------
+    before = calls["agent"]
+    out = await chat.send(B, "my netid password is Hunter22!", name="Maya")
+    check("a NetID password is refused", any("password" in m["text"].lower() for m in out), str(out))
+    check("the password never reaches the agent", calls["agent"] == before)
+    check("the password is never logged", not bot._db.execute("SELECT 1 FROM messages WHERE text LIKE '%Hunter22%'").fetchone())
+    check("users never write to the shared NYU knowledge", not fake.shared_writes(), str(fake.shared_writes()))
+
     # ---------- limits and blocking ----------
     users.set_limits(B, messages=users.used(B, "messages") + 1)
     await chat.send(B, "hello", name="Maya")

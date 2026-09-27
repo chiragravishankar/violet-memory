@@ -125,8 +125,15 @@ _SUBMISSION_HOSTS = re.compile(r"brightspace|d2l|gradescope|turnitin", re.I)
 
 
 def email_known(user_id, address: str) -> bool:
-    """An address may be used only if the user gave it: in their own messages or saved on a person."""
+    """An address may be used only if the user gave it (their messages, a person's entry, their mail), or
+    it's an official NYU office address from config/nyu_offices.json (each one sourced from nyu.edu)."""
     a = address.strip().lower()
+    try:
+        import nyu
+        if any(str(o.get("email") or "").lower() == a for o in nyu.offices()):
+            return True
+    except Exception:
+        pass
     for f in selfmodel.get_profile(user_id)["people"]:
         if str(f.get("attrs", {}).get("email", "")).lower() == a:
             return True

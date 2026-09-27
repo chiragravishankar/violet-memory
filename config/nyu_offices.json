@@ -1,0 +1,370 @@
+{
+ "_about": "Official NYU offices Violet points students to. Built from nyu.edu pages by scripts/nyu_offices_refresh.py; every detail has a source. Edit freely.",
+ "offices": [
+  {
+   "name": "Office of Global Services (OGS)",
+   "url": "https://www.nyu.edu/ogs",
+   "email": "ogs@nyu.edu",
+   "phone": "(212) 998-4720",
+   "location": "383 Lafayette Street, New York, NY 10003",
+   "hours": "Monday - Friday from 9am to 5pm",
+   "sources": [
+    "https://www.nyu.edu/ogs",
+    "https://publichealth.nyu.edu/students/international-students/key-contacts",
+    "https://www.law.nyu.edu/graduateaffairs/handbook/key-law-school-and-university-offices",
+    "https://tisch.nyu.edu/admissions/graduate-admissions/newly-admitted-graduate-students-welcome-page"
+   ],
+   "topics": [
+    "visas",
+    "F-1/J-1 status",
+    "I-20",
+    "CPT",
+    "OPT",
+    "travel signatures",
+    "international students"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "Office of the University Registrar (StudentLink Center)",
+   "url": "https://www.nyu.edu/registrar",
+   "email": "registrar@nyu.edu",
+   "phone": "(212) 998-4800",
+   "location": "StudentLink Center, 383 Lafayette Street, New York, NY 10003",
+   "hours": null,
+   "sources": [
+    "https://tisch.nyu.edu/student-affairs/news/university-services-over-winter-break",
+    "https://tisch.nyu.edu/content/dam/tisch/student-affairs/AcademicServiceForms/P-PAY2024accessible.pdf"
+   ],
+   "topics": [
+    "registration",
+    "adding and dropping classes",
+    "holds",
+    "transcripts",
+    "enrollment verification",
+    "academic calendar"
+   ],
+   "checked": "2026-09-27",
+   "note": "registrar@nyu.edu is listed for registration concerns on a Tisch page; for holds, the StudentLink Center (phone or walk-in) is the official route."
+  },
+  {
+   "name": "Office of the Bursar",
+   "url": "https://www.nyu.edu/students/student-information-and-resources/bills-payments-and-refunds/contact-us.html",
+   "email": "bursar.studentaccounts@nyu.edu",
+   "phone": "212-998-2806",
+   "location": null,
+   "hours": null,
+   "sources": [
+    "https://www.nyu.edu/students/student-information-and-resources/bills-payments-and-refunds/contact-us.html",
+    "https://bulletins.nyu.edu/graduate/individualized-study/cost-attendance/tuition-fees/",
+    "https://bulletins.nyu.edu/graduate/global-public-health/cost-attendance/financial-aid/"
+   ],
+   "topics": [
+    "tuition bills",
+    "payments",
+    "refunds",
+    "payment plans",
+    "financial holds"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "NYU Office of Financial Aid",
+   "url": "https://www.nyu.edu/admissions/financial-aid-and-scholarships.html",
+   "email": "financial.aid@nyu.edu",
+   "phone": "212-998-4444",
+   "location": "StudentLink Center (Manhattan), 383 Lafayette Street, New York, NY 10003",
+   "hours": "Monday through Friday 9 a.m. to 5 p.m.",
+   "sources": [
+    "https://www.nyu.edu/admissions/financial-aid-and-scholarships.html",
+    "https://www.sps.nyu.edu/content/dam/sps-nyu/join/undergraduate-admissions/undergraduate-tuition-financial-aid/Undergraduate-Financial-Aid-Guidelines-2025-2026.pdf",
+    "https://bulletins.nyu.edu/nyu/cost-attendance/",
+    "https://bulletins.nyu.edu/undergraduate/nursing/cost-attendance/financial-aid/"
+   ],
+   "topics": [
+    "financial aid",
+    "scholarships",
+    "loans",
+    "FAFSA",
+    "work-study"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "NYU Student Health Center (SHC)",
+   "url": "https://www.nyu.edu/students/health-and-wellness/student-health-center.html",
+   "email": "health.center@nyu.edu",
+   "phone": "(212) 443-1000",
+   "location": "726 Broadway, 3rd and 4th Floors, New York, NY 10003",
+   "hours": null,
+   "sources": [
+    "https://www.nyu.edu/students/health-and-wellness/student-health-center.html",
+    "https://www.law.nyu.edu/sites/default/files/upload_documents/FINAL%20Student%20Life%20Guide.pdf",
+    "https://www.law.nyu.edu/graduateaffairs/handbook/key-law-school-and-university-offices",
+    "https://www.law.nyu.edu/directories/departments"
+   ],
+   "topics": [
+    "medical appointments",
+    "immunizations",
+    "insurance waivers",
+    "health"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "NYU Wellness Exchange",
+   "url": "https://publichealth.nyu.edu/students/current/safety-health-wellness",
+   "email": "wellness.exchange@nyu.edu",
+   "phone": "212-443-9999",
+   "location": "third floor of 726 Broadway",
+   "hours": "24 hours a day, 7 days a week",
+   "sources": [
+    "https://publichealth.nyu.edu/students/current/safety-health-wellness",
+    "https://publichealth.nyu.edu/students/current/student-services"
+   ],
+   "topics": [
+    "mental health support",
+    "counseling",
+    "crisis support",
+    "24/7 hotline"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "Henry and Lucy Moses Center for Student Accessibility",
+   "url": "https://www.nyu.edu/students/communities-and-groups/student-accessibility.html",
+   "email": "mosescsa@nyu.edu",
+   "phone": "212-998-4980",
+   "location": "726 Broadway 3rd Floor, New York, NY 10003",
+   "hours": null,
+   "sources": [
+    "https://bulletins.nyu.edu/nyu/student-services/accommodations/",
+    "https://www.nyu.edu/students/communities-and-groups/student-accessibility.html"
+   ],
+   "topics": [
+    "disability accommodations",
+    "accessibility"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "Office of Residential Life and Housing Services",
+   "url": "https://www.nyu.edu/students/student-information-and-resources/housing-and-dining/on-campus-living.html",
+   "email": "housing@nyu.edu",
+   "phone": "212-998-4600",
+   "location": "726 Broadway, 7th Floor",
+   "hours": "Mon \u2013 Fri: 9:00 a.m. \u2013 5:00 p.m.; Sat \u2013 Sun: Closed",
+   "sources": [
+    "https://www.nyu.edu/students/student-information-and-resources/housing-and-dining/on-campus-living.html",
+    "https://bulletins.nyu.edu/undergraduate/culture-education-human-development/student-services/",
+    "https://housing.nyu.edu/summer/living-at-nyu/"
+   ],
+   "topics": [
+    "housing",
+    "residence halls",
+    "housing assignments",
+    "housing contracts"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "NYU Dining",
+   "url": "https://housing.nyu.edu/summer/living-at-nyu/dining-meal-plans/",
+   "email": "dining.services@nyu.edu",
+   "phone": null,
+   "location": null,
+   "hours": null,
+   "sources": [
+    "https://housing.nyu.edu/summer/living-at-nyu/dining-meal-plans/",
+    "https://tisch.nyu.edu/film-tv/CurrentStudentInfo/help-and-resources"
+   ],
+   "topics": [
+    "meal plans",
+    "dining halls",
+    "Campus Cash",
+    "dining dollars"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "NYU IT Service Desk",
+   "url": "https://www.nyu.edu/it/help",
+   "email": "AskIT@nyu.edu",
+   "phone": "212-998-3333",
+   "location": "10 Astor Place, 4th floor, New York, NY 10003",
+   "hours": "24x7; in-person Monday through Friday, 9:00am to 6:00pm ET",
+   "sources": [
+    "https://www.nyu.edu/it/help",
+    "https://it.stern.nyu.edu/for-staffadmins/onboarding/articles/nyu-stern-accounts",
+    "https://engineering.nyu.edu/information-technology",
+    "https://wp.nyu.edu/contact/",
+    "https://sis.nyu.edu/psc/csprod/EMPLOYEE/HRMS/c/NYU_AWS_SS.NYU_AAWS_LOGIN.GBL?APP_TYPE=GPRUV1"
+   ],
+   "topics": [
+    "NetID",
+    "passwords",
+    "email",
+    "Wi-Fi",
+    "software",
+    "ServiceLink tickets",
+    "tech help"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "NYU Card Center",
+   "url": "https://tisch.nyu.edu/faculty/faq",
+   "email": "nyucard@nyu.edu",
+   "phone": "(212) 443-2273",
+   "location": "7 Washington Place (at the corner of Mercer Street)",
+   "hours": "Monday to Friday: 8:00 am to 8:00 pm",
+   "sources": [
+    "https://tisch.nyu.edu/faculty/faq"
+   ],
+   "topics": [
+    "NYU ID card",
+    "replacing a lost ID",
+    "card access"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "Printing at Tandon (Bern Dibner Library)",
+   "url": "https://library.nyu.edu/locations/bern-dibner-library/",
+   "email": "dibner.library@nyu.edu",
+   "phone": "+1 646 997 3530",
+   "location": "5 MetroTech Center Brooklyn, NY 11201-9818",
+   "hours": "View hours",
+   "sources": [
+    "https://library.nyu.edu/locations/bern-dibner-library/",
+    "https://library.nyu.edu/services/print-copy-scan/print/print-rates/"
+   ],
+   "topics": [
+    "printing on campus",
+    "print stations",
+    "NYU print",
+    "printing at Tandon and Dibner"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "Wasserman Center for Career Development",
+   "url": "https://wasserman.nyu.edu/",
+   "email": "handshake@nyu.edu",
+   "phone": "(212) 998-4730",
+   "location": "Palladium Hall, 2nd Floor, 133 E. 13th St., New York, NY 10003",
+   "hours": "M 9:00 am - 5:00 pm; T 9:00 am - 5:00 pm; W 9:00 am - 5:00 pm; TH 9:00 am - 5:00 pm; F 9:00 am - 5:00 pm",
+   "sources": [
+    "https://wasserman.nyu.edu/",
+    "https://wasserman.nyu.edu/nyu-advisors-career-development-resources/",
+    "https://wasserman.nyu.edu/resources/4094/"
+   ],
+   "topics": [
+    "careers",
+    "internships",
+    "jobs",
+    "Handshake",
+    "resume reviews",
+    "career fairs"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "NYU Libraries (Ask a Librarian)",
+   "url": "https://library.nyu.edu/ask/",
+   "email": null,
+   "phone": "+1-646-265-1342",
+   "location": null,
+   "hours": "Weekly Hours",
+   "sources": [
+    "https://library.nyu.edu/ask/",
+    "https://library.nyu.edu/contact/",
+    "https://library.nyu.edu/"
+   ],
+   "topics": [
+    "library help",
+    "research",
+    "borrowing",
+    "study spaces"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "NYU Tandon Office of Graduate Academics",
+   "url": "https://engineering.nyu.edu/academics/graduate/office-graduate-academics",
+   "email": "soegradacademics@nyu.edu",
+   "phone": "646-997-3196",
+   "location": null,
+   "hours": null,
+   "sources": [
+    "https://engineering.nyu.edu/academics/graduate/office-graduate-academics",
+    "https://engineering.nyu.edu/information-students"
+   ],
+   "topics": [
+    "Tandon graduate advising",
+    "Tandon academic policies",
+    "Tandon registration questions"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "NYU Leslie Entrepreneurial Institute",
+   "url": "https://entrepreneur.nyu.edu/about-us/",
+   "email": "entrepreneur@nyu.edu",
+   "phone": "212-992-6070",
+   "location": "16 Washington Place (at Greene St.), New York, NY 10003",
+   "hours": "Mondays \u2013 Thursdays, 10AM \u2013 8PM; Fridays: 10AM \u2013 6PM",
+   "sources": [
+    "https://entrepreneur.nyu.edu/about-us/",
+    "https://entrepreneur.nyu.edu/resource/leslie-elab/",
+    "https://entrepreneur.nyu.edu/app/uploads/2020/05/NYU-EI-18AR-min.pdf"
+   ],
+   "topics": [
+    "startups",
+    "entrepreneurship programs",
+    "Leslie eLab"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "NYU Campus Safety",
+   "url": "https://meet.nyu.edu/locations/campus-safety/",
+   "email": "public.safety@nyu.edu",
+   "phone": "212-998-2222",
+   "location": "561 LaGuardia Place; 7 Washington Place; 2 MetroTech; 370 Jay Street",
+   "hours": "561 LaGuardia Place lobby open around the clock; 7 Washington Place lobby during weekday business hours; 2 MetroTech ID Card Service Center open Monday through Friday; 370 Jay Street open Monday through Friday, staffed 8:30 a.m. to 11 p.m., Lost and Found desk 8:30 a.m. to 5 p.m.",
+   "sources": [
+    "https://meet.nyu.edu/locations/campus-safety/",
+    "https://bulletins.nyu.edu/undergraduate/culture-education-human-development/student-services/",
+    "https://publichealth.nyu.edu/students/current/safety-health-wellness",
+    "https://engineering.nyu.edu/facilities-and-operations/campus-services"
+   ],
+   "topics": [
+    "campus safety",
+    "emergencies",
+    "lost and found",
+    "escorts"
+   ],
+   "checked": "2026-09-27"
+  },
+  {
+   "name": "NYU Transportation Services",
+   "url": "https://www.nyu.edu/ride",
+   "email": null,
+   "phone": "212.998.7433",
+   "location": null,
+   "hours": null,
+   "sources": [
+    "https://itp.nyu.edu/itp/visit-us/",
+    "https://tisch.nyu.edu/art-public-policy/admissions/how-to-find-us",
+    "https://tisch.nyu.edu/student-affairs/parents/new-york---nyu"
+   ],
+   "topics": [
+    "campus shuttles",
+    "NYU transit",
+    "shuttle routes"
+   ],
+   "checked": "2026-09-27"
+  }
+ ]
+}
