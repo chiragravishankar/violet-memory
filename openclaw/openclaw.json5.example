@@ -1,0 +1,45 @@
+{
+  // Violet's front door: OpenClaw owns Telegram, Violet (Python) does all the work. No model is ever
+  // called: the violet-bridge plugin claims every message before dispatch.
+  gateway: {
+    mode: "local",
+    bind: "loopback",
+    port: 18789,
+    auth: { mode: "token" }, // token from OPENCLAW_GATEWAY_TOKEN (only in Violet's .env)
+  },
+  session: { dmScope: "per-channel-peer" }, // every sender has their own session
+  channels: {
+    telegram: {
+      enabled: true,
+      botToken: "${VIOLET_BOT_TOKEN}",
+      dmPolicy: "open", // Violet's own invite gate and waitlist decide who gets in
+      allowFrom: ["*"],
+      groupPolicy: "disabled",
+      joinIntro: false,
+      commands: { native: false },
+      capabilities: { inlineButtons: "dm" },
+      streaming: { mode: "off" },
+      dmHistoryLimit: 0,
+      ackReaction: "",
+    },
+  },
+  commands: { native: false, nativeSkills: false, text: false, restart: false },
+  messages: { inbound: { byChannel: { telegram: 0 } } },
+  tools: {
+    profile: "minimal",
+    // Violet transcribes and reads files itself: OpenClaw must not (no model calls, no double cost)
+    media: { audio: { enabled: false }, image: { enabled: false }, video: { enabled: false } },
+    alsoAllow: ["message"],
+    deny: ["group:runtime", "group:fs", "group:ui", "group:web", "group:memory", "group:automation",
+           "group:nodes", "group:sessions", "group:agents", "group:media", "gateway"],
+  },
+  plugins: {
+    // Only what Violet needs: no browser, computer use, file transfer, memory, LAN discovery (bonjour), etc.
+    allow: ["telegram", "violet-bridge"],
+    slots: { memory: "none" }, // no OpenClaw long-term memory (Violet's memory is Cognee)
+    load: { paths: ["<repo>/openclaw/plugin"] },
+    entries: {
+      "violet-bridge": { enabled: true, hooks: { allowConversationAccess: true } },
+    },
+  },
+}
