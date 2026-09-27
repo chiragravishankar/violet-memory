@@ -201,6 +201,8 @@ async def offer_card(bot, chat_id: int, user_id, action_id: str) -> None:
     a = actions.get(action_id)
     if a is None:
         return
+    if str(user_id) != str(feeds.calendar_user()):
+        return  # the Google account is the owner's: nobody else gets cards that would act on it
     if a.type == "calendar_add" and actions.calendar_mode(user_id) == "auto" and gaccount.connected():
         await _send_outcome(bot, chat_id, a.id, await actions.approve(user_id, a.id, "do", "setting"))
         return
@@ -1128,7 +1130,8 @@ async def email_loop(app: Application) -> None:
     told_reconnect, last_nudges = set(), None
     while True:
         now = datetime.now(schedule.TZ)
-        for user_id in event_users():
+        # One Google connection, and it belongs to the owner: never read it on anyone else's behalf.
+        for user_id in [u for u in [feeds.calendar_user()] if u]:
             try:
                 if not gaccount.connected():
                     continue

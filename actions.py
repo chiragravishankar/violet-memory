@@ -311,6 +311,10 @@ async def approve(user_id, action_id: str, op: str, via: str) -> Outcome:
         return Outcome("That button doesn't fit this card.")
     if via not in ("button", "text", "setting") or (via == "setting" and a.type != "calendar_add"):
         return Outcome("Only you can approve this.")
+    import os
+    owner = os.getenv("CALENDAR_USER_ID") or os.getenv("GOOGLE_ICS_USER_ID")
+    if owner and str(user_id) != str(owner):
+        return Outcome("Only the account owner can approve actions on the connected Google account.")
     target = "sending" if (a.type == "email" and op == "send") else "executing"
     if a.type == "email" and op == "send" and emails_sent_today(user_id) >= MAX_EMAILS_PER_DAY:
         return Outcome(f"That would be more than {MAX_EMAILS_PER_DAY} emails today, so I'm holding it. "
