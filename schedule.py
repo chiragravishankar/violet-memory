@@ -12,6 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import llm
+import delivered
 import paths
 
 log = logging.getLogger("schedule")
@@ -624,7 +625,7 @@ def sync_events(user_id, events: list[Item], source: str) -> SyncResult:
 
 
 def add_event(user_id, it: Item, source: str) -> bool:
-    """Put an event he's going to on his calendar (with reminders). False if already there."""
+    """Put an event the user is going to on their calendar (with reminders). False if already there."""
     uid = str(user_id)
     if _db.execute("SELECT 1 FROM items WHERE user_id = ? AND uid = ?", (uid, it.uid)).fetchone():
         return False
@@ -867,6 +868,9 @@ def pop_due_reminders(now: datetime | None = None, quiet_until=None) -> list[tup
         _db.commit()
         if now - datetime.fromisoformat(r["remind_at"]) > STALE_AFTER:
             continue
+        # The delivery log is the real record: it survives the item being deleted and re-created.
+        if not delivered.claim(r["ruser"], "reminder", delivered.reminder_key(r["uid"], r["title"], r["remind_at"], r["lead"])):
+            continue
         out.append((r["ruser"], _row_to_item(r), r["lead"]))
     return out
 
@@ -878,6 +882,20 @@ def preview_reminders(user_id, at: datetime, window: timedelta = timedelta(minut
         for lead, when in reminder_plan(it, at - window + timedelta(seconds=1), at + timedelta(seconds=1)):
             out.append((it, lead))
     return out
+
+
+def fire_demo_reminders(user_id, at: datetime) -> tuple[list[tuple[Item, str]], int]:
+    """/demo_time: the reminders due at that moment, each claimed in the delivery log (as reminder_demo, so a
+    test never blocks the real reminder). Returns (new ones to send, how many already went out)."""
+    new, already = [], 0
+    for it, lead in preview_reminders(user_id, at):
+        when = [w for l, w in reminder_plan(it, at - timedelta(minutes=5) + timedelta(seconds=1), at + timedelta(seconds=1)) if l == lead]
+        key = delivered.reminder_key(it.uid, it.title, (when[0] if when else at).astimezone(timezone.utc).isoformat(), lead)
+        if delivered.claim(user_id, "reminder_demo", key):
+            new.append((it, lead))
+        else:
+            already += 1
+    return new, already
 
 
 def reminder_text(it: Item, lead: str) -> str:
@@ -975,7 +993,7 @@ def split_class_title(title: str) -> tuple[str, str | None]:
 def agenda_entries(user_id, start: date, end: date, now: datetime | None = None,
                    kinds: set[str] | None = None) -> list[Entry]:
     """Everything from start to end (both days included, the last up to 11:59 PM), in day and
-    time order: weekly classes, class sessions, meetings, events he's going to, deadlines and exams,
+    time order: weekly classes, class sessions, meetings, events the user is going to, deadlines and exams,
     from every source. /today, /week, schedule questions and the brief all use this."""
     now = now or datetime.now(TZ)
     items = [i for i in existing_items(user_id) if not i.done and (kinds is None or i.kind in kinds)]

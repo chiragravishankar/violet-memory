@@ -61,7 +61,7 @@ Text:
 
 async def rewrite(user_id, text: str, structured: bool) -> tuple[str, bool]:
     """(what to say, whether it was shortened). Structured views get a one or two sentence summary."""
-    shape = ("It's a formatted list he can see below: say a one or two sentence summary of what matters most, "
+    shape = ("It's a formatted list the user can see below: say a one or two sentence summary of what matters most, "
              "then that the full list is below." if structured else "Keep the meaning and personality.")
     data = await llm.chat_json(
         [{"role": "system", "content": voice.system_prompt(user_id)},

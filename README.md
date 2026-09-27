@@ -355,3 +355,46 @@ an address, and saves what it finds on the professor's entry in the people store
 
 **Test:** `tests/nyu_live_demo.py` sends the test questions through the real handlers, and Violet's
 replies arrive in the owner's Telegram.
+
+## Reliability and the people loop
+
+**Email sorting.**
+- Emails are stored before they're sorted. Every sync retries up to 36 stored-but-unsorted emails
+  (`inbox.retry_unsorted`), re-fetching their text read-only.
+- Each failure is recorded per message (`classify_attempts`, `classify_error`), including invalid JSON
+  from the model; nothing is skipped silently. An email stops being retried after 5 attempts.
+- Email deadlines are applied only if their date hasn't passed.
+- Needs-reply threads found more than 7 days late are never pushed as nudges.
+- Automated no-reply senders never count as needing a reply.
+- Booking and notification services (Cal.com, Calendly, Zoom…) never become a person's email address.
+
+**Nothing is sent twice.**
+- `delivered.py` is a delivery log: reminders, the daily brief, the weekly preview, event picks,
+  check-ins, follow-up reminders and the weekly reflection are each claimed before they go out.
+- Keys are stable, so they survive restarts and items that are deleted and re-created (for example by
+  a feed sync).
+- `/demo_time` fires reminders into the same log under a separate `reminder_demo` kind, so a test never
+  blocks a real reminder.
+- `tests/test_no_resend.py` checks this across a real restart.
+
+**Brief prepared ahead.** 15 minutes before the brief, `brief.prepare` wakes Cognee and fetches each
+agenda item's memory context. The brief then builds in about 2 seconds. If memory still isn't ready,
+the brief goes out without it.
+
+**People loop.**
+- **`/people`:** who you've met, grouped by where, newest first, 15 per page.
+- **`/followups`:** real follow-up records (person, promise, due date, status open/done/snoozed). They
+  replace title matching; existing follow-up-like schedule items are migrated at startup.
+- **Follow-up reminders:** sent on the due day from 10 AM, with ✍️ Draft message / ✅ Done / ⏰ Snooze
+  2 days. Done updates the person's `last_contact`.
+- **Post-event check-in:** the morning after an event you said "going" to, or a networking-type
+  calendar event, the brief asks "Who'd you meet at X?" with 🎙 Tell you now / Didn't go / Nobody new,
+  once per event.
+- **Agent tools:** `add_person` (where met, field), `add_followup`, `followup_done`, `people_search`,
+  and `get_followups` (optionally for one person).
+
+**NYU answers in parallel.** The local index, the Cognee `nyu_knowledge` recall and the live nyu.edu
+search start together, and the first confident answer within 20 s wins. A late Cognee answer is
+never waited for.
+
+**Tests:** `tests/test_isolation.py`, `tests/test_no_resend.py`, `tests/test_people_loop.py`.

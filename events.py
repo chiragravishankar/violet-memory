@@ -184,33 +184,33 @@ def upcoming(start: datetime, end: datetime) -> list[Event]:
 
 # ---------- Scoring ----------
 
-SCORE_PROMPT = """Score NYU events for one student, 0 to 100, by how worth his time each is.
+SCORE_PROMPT = """Score NYU events for one student, 0 to 100, by how worth their time each is.
 
-What he has told you about himself (the only facts about him you may use):
+What the user has told you about themselves (the only facts about them you may use):
 {profile}
-He liked events like: {likes}
-He said "not for me" to: {dislikes}
+The user liked events like: {likes}
+The user said "not for me" to: {dislikes}
 
 Calibration:
-- 90 to 100: a direct hit on something specific he's doing (from the profile above): one of his named
-  projects (say which), his courses, clubs or programs he's in, employer recruiting in his target fields.
-- 70 to 89: clearly useful for one of his goals (say which), e.g. a talk, workshop or hackathon in his
-  areas, or an event at his school on his topics.
+- 90 to 100: a direct hit on something specific the user is doing (from the profile above): one of their named
+  projects (say which), their courses, clubs or programs the user is in, employer recruiting in their target fields.
+- 70 to 89: clearly useful for one of their goals (say which), e.g. a talk, workshop or hackathon in their
+  areas, or an event at their school on their topics.
 - 40 to 60: generic career or skills workshops (resume, LinkedIn, interviews, soft skills),
-  general networking, fairs outside his fields.
-- 0 to 30: no specific link to him (athletics, arts, library trainings, religious or cultural
+  general networking, fairs outside their fields.
+- 0 to 30: no specific link to them (athletics, arts, library trainings, religious or cultural
   club meetings, other programs' events), faculty or staff only, undergrad only, alumni only,
   other campuses (Abu Dhabi, Shanghai), canceled.
-- "Internship search" is a reason only for recruiting events with employers or career fairs in his
+- "Internship search" is a reason only for recruiting events with employers or career fairs in their
   fields, never for generic workshops or club meetings.
 - A title starting with "DEADLINE:" is a sign-up deadline for a program; judge the program.
-- Boost in-person events in Brooklyn or Manhattan, and at his school or the places he mentions.
+- Boost in-person events in Brooklyn or Manhattan, and at their school or the places the user mentions.
 
-reason: one short line to him, 14 words at most, always "you"/"your" (never his name or "his"). It must say what THIS
-event actually is (a dinner, a panel, a workshop, a hackathon...) and which specific thing of his it
-fits: a named project, a goal, a course or a program from his profile, by name. Write each reason fresh for its event; never reuse
+reason: one short line to them, 14 words at most, always "you"/"your" (never their name or "their"). It must say what THIS
+event actually is (a dinner, a panel, a workshop, a hackathon...) and which specific thing of their it
+fits: a named project, a goal, a course or a program from their profile, by name. Write each reason fresh for its event; never reuse
 wording from another event. Don't start with "Right up". No specific reason: score
-30 or less and say it's generic. Never invent facts about him.
+30 or less and say it's generic. Never invent facts about them.
 deadline: the registration, RSVP or application deadline as YYYY-MM-DD only if the text states a
 date for it, else null. Today is {today}.
 
@@ -422,7 +422,7 @@ def scored(user_id, e: Event) -> Scored | None:
 
 
 def _blocks(user_id, day: date) -> list[tuple[datetime, datetime, str, bool, str]]:
-    """(start, end, description, is_class, title) for everything on his calendar that day."""
+    """(start, end, description, is_class, title) for everything on their calendar that day."""
     out = []
     for it in schedule.existing_items(user_id):
         if it.kind == "class" and it.weekday == day.weekday() and it.start_time and day <= schedule.SEMESTER_END:
@@ -444,7 +444,7 @@ def _blocks(user_id, day: date) -> list[tuple[datetime, datetime, str, bool, str
 
 
 def conflicts(user_id, e: Event) -> tuple[list[str], bool, bool]:
-    """(clash descriptions, clashes with a class, the same event is already on his calendar)."""
+    """(clash descriptions, clashes with a class, the same event is already on their calendar)."""
     if e.all_day:
         return [], False, False
     end = e.end if e.end and e.end > e.start else e.start + timedelta(minutes=90)
@@ -601,7 +601,7 @@ def fact_line(s: Scored) -> str:
     if s.deadline:
         parts.append(f"register by {schedule.fmt_day(s.deadline)}")
     parts += flag_notes(e)
-    parts.append(f"clashes with {', '.join(s.conflicts)}" if s.conflicts else "he's free then")
+    parts.append(f"clashes with {', '.join(s.conflicts)}" if s.conflicts else "the user is free then")
     if s.label:
         parts.append(s.label)
     parts.append(f"link: {e.url}")
@@ -630,7 +630,7 @@ def flag_notes(e: Event) -> list[str]:
 
 
 def remember_list(user_id, ids: list[str]) -> None:
-    """The events he was just shown, so "going" or "not for me" knows what he means."""
+    """The events the user was just shown, so "going" or "not for me" knows what the user means."""
     selfmodel.set_meta(user_id, last_events={"ids": ids, "at": _utcnow()})
 
 
@@ -713,9 +713,9 @@ async def act(user_id, action: str, e: Event) -> str:
         await brain.save(user_id, f"I'm going to {e.title} ({e.organizer or 'NYU'}) on {when(e)} at {where(e)}. {e.url}")
         tail = "Reminders 1 day and 2 hours before." if not e.all_day else ""
         if "needs_approval" in e.flags:
-            tail += " It needs host approval, so apply now; you'll remind him to check his approval 2 days before."
-        return (f"Added to his calendar: {e.title}, {when(e)}, {where(e)}. {tail} Link to register if needed: {e.url}"
-                if added else f"{e.title} is already on his calendar.")
+            tail += " It needs host approval, so apply now; you'll remind them to check their approval 2 days before."
+        return (f"Added to their calendar: {e.title}, {when(e)}, {where(e)}. {tail} Link to register if needed: {e.url}"
+                if added else f"{e.title} is already on their calendar.")
     if action == "hide":
         _set_state(user_id, e.id, "hidden")
         _db.execute("INSERT INTO event_prefs (user_id, kind, text, created_at) VALUES (?, 'dislike', ?, ?)",
@@ -731,4 +731,4 @@ async def act(user_id, action: str, e: Event) -> str:
         day = e.start.date() - timedelta(days=1)
         _set_state(user_id, e.id, "later", day.isoformat())
         return f"You'll bring up {e.title} again on {schedule.fmt_day(day)}, the day before."
-    return "Not sure what he wanted there."
+    return "Not sure what the user wanted there."

@@ -89,30 +89,78 @@ CAMPUS_HINTS = {"tandon": "dibner brooklyn", "brooklyn": "dibner", "metrotech": 
                 "stern": "bobst"}
 
 
-async def search(question: str) -> dict:
-    """What NYU's own pages say, with sources. Knowledge base first, live nyu.edu search if needed."""
+SEARCH_BUDGET = 20.0  # seconds for an NYU answer
+PREFER_KB = 2.5  # if a knowledge-base answer lands within this long of a live one, prefer it (it has dates)
+
+
+async def _kb_answer(question: str) -> dict | None:
+    """The local index (crawled nyu.edu pages): fast, exact source URLs."""
     low = question.lower()
     hints = " ".join(v for k, v in CAMPUS_HINTS.items() if k in low)
     pages = nyu_kb.search(f"{question} {hints}", k=5)
-    kb_graph = asyncio.ensure_future(brain.shared_context(nyu_kb.DATASET, question, wait=5))
-    out = None
-    if pages:
-        text = "\n\n".join(f"[{p['url']}] (fetched {p['fetched']}) {p['title']}\n{p['excerpt']}" for p in pages)
-        graph = await kb_graph
-        if graph:
-            text += f"\n\n[knowledge graph, same pages]\n{graph[:2000]}"
-        try:
-            data = await llm.chat_json([{"role": "user", "content": ANSWER_TASK.format(question=question, pages=text[:14000])}],
-                                       model_name=ANSWER_MODEL)
-            if data.get("confident") and data.get("answer"):
-                out = {"answer": data["answer"], "sources": data.get("sources") or [p["url"] for p in pages[:2]],
-                       "as_of": data.get("as_of") or pages[0]["fetched"], "from": "NYU knowledge base (crawled nyu.edu pages)"}
-        except Exception as e:
-            log.info("kb answer failed (%s)", type(e).__name__)
-    else:
-        kb_graph.cancel()
-    if out is None:
-        out = await live(question)
+    if not pages:
+        return None
+    text = "\n\n".join(f"[{p['url']}] (fetched {p['fetched']}) {p['title']}\n{p['excerpt']}" for p in pages)
+    return await _answer_from(question, text, [p["url"] for p in pages[:2]], pages[0]["fetched"],
+                              "NYU knowledge base (crawled nyu.edu pages)")
+
+
+async def _graph_answer(question: str) -> dict | None:
+    """The shared Cognee dataset nyu_knowledge (same pages, as a graph); its documents carry Source: lines."""
+    ctx = await brain.shared_context(nyu_kb.DATASET, question, wait=SEARCH_BUDGET)
+    if not ctx:
+        return None
+    urls = re.findall(r"Source: (https://\S+)", ctx)
+    return await _answer_from(question, ctx[:12000], urls[:2], None, "NYU knowledge graph (Cognee)") if urls else None
+
+
+async def _answer_from(question: str, text: str, fallback_sources: list[str], as_of: str | None, origin: str) -> dict | None:
+    try:
+        data = await llm.chat_json([{"role": "user", "content": ANSWER_TASK.format(question=question, pages=text[:14000])}],
+                                   model_name=ANSWER_MODEL)
+    except Exception as e:
+        log.info("nyu answer failed (%s)", type(e).__name__)
+        return None
+    if not (data.get("confident") and data.get("answer")):
+        return None
+    return {"answer": data["answer"], "sources": data.get("sources") or fallback_sources,
+            "as_of": data.get("as_of") or as_of, "from": origin}
+
+
+async def search(question: str) -> dict:
+    """What NYU's own pages say, with sources. The local index, the Cognee knowledge graph and a live nyu.edu
+    search all start at once; the first confident answer within the budget wins (a knowledge-base answer is
+    preferred when it lands close behind the live one). A late Cognee answer is never waited for."""
+    t0 = asyncio.get_running_loop().time()
+    tasks = {asyncio.ensure_future(_kb_answer(question)): "kb", asyncio.ensure_future(_graph_answer(question)): "graph",
+             asyncio.ensure_future(live(question)): "live"}
+    pending, out, live_result = set(tasks), None, None
+    while pending and out is None:
+        left = SEARCH_BUDGET - (asyncio.get_running_loop().time() - t0)
+        if left <= 0:
+            break
+        done, pending = await asyncio.wait(pending, timeout=left, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            r = task.result() if not task.exception() else None
+            if not r or not r.get("answer"):
+                continue
+            if tasks[task] == "live":
+                live_result = r
+                kb_left = [p for p in pending if tasks[p] == "kb"]
+                if kb_left:  # give the knowledge base a moment: its answer carries dated, crawled sources
+                    d2, _ = await asyncio.wait(kb_left, timeout=PREFER_KB)
+                    k = next((x.result() for x in d2 if not x.exception() and x.result()), None)
+                    out = k or live_result
+                else:
+                    out = live_result
+            else:
+                out = r
+            break
+    for p in pending:
+        p.cancel()
+    out = out or live_result or {"answer": "", "sources": [], "from": "nothing found in time", "unsure": True}
+    out["seconds"] = round(asyncio.get_running_loop().time() - t0, 1)
+    log.info("nyu search answered from %s in %.1fs", out["from"], out["seconds"])
     if sensitive(question):
         out["rule"] = ("Sensitive topic (immigration, health, legal or financial aid): give the official information "
                        "and the right office only, no personal advice.")

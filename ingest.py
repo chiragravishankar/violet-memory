@@ -47,10 +47,10 @@ async def process_file(user_id, path: Path, file_name: str, caption: str | None)
     if await selfmodel.is_resume(extracted.text, caption, file_name):
         added = await selfmodel.seed_from_resume(user_id, extracted.text)
         if not added:
-            return Draft(f"Read his resume ({name}{pages}). Nothing new about him in it.", kind="save")
+            return Draft(f"Read their resume ({name}{pages}). Nothing new about them in it.", kind="save")
         shown = [f"• {f['text']}" for f in added[:10]] + ([f"...and {len(added) - 10} more"] if len(added) > 10 else [])
-        return Draft(f"Read his resume ({name}{pages}) and picked up {len(added)} things about him (listed below). "
-                     "He can see everything with /me and fix anything with /me edit.",
+        return Draft(f"Read their resume ({name}{pages}) and picked up {len(added)} things about them (listed below). "
+                     "The user can see everything with /me and fix anything with /me edit.",
                      attach="\n".join(shown), kind="save")
 
     items = await schedule.extract(extracted.text, _context(file_name, caption))
@@ -58,11 +58,11 @@ async def process_file(user_id, path: Path, file_name: str, caption: str | None)
     await schedule.normalize_titles(user_id, selfmodel.owner_name(user_id))
     facts = [f"Read {name}{pages}, and will remember what's in it."]
     if result.added:
-        facts.append(f"Added {_count_words(result)} to his calendar (listed below). /undo removes them.")
+        facts.append(f"Added {_count_words(result)} to their calendar (listed below). /undo removes them.")
     elif not result.duplicates:
         facts.append("No dated deadlines or class times in it.")
     if result.duplicates:
-        facts.append(f"Skipped {result.duplicates} already in his calendar.")
+        facts.append(f"Skipped {result.duplicates} already in their calendar.")
     if result.past:
         facts.append(f"Skipped {result.past} with dates already past.")
     return Draft(" ".join(facts), attach="\n".join(item_lines(result)) or None, kind="save")
@@ -82,8 +82,8 @@ async def process_chat(user_id, text: str) -> Draft | None:
     if not result.added:
         if not result.duplicates:
             return None
-        return Draft("That's already in his calendar, nothing new added.", kind="schedule")
-    facts = ["Added to his calendar: " + "; ".join(item_lines(result, numbered=False)) + "."]
+        return Draft("That's already in their calendar, nothing new added.", kind="schedule")
+    facts = ["Added to their calendar: " + "; ".join(item_lines(result, numbered=False)) + "."]
     for it in result.added:
         if it.kind == "class":
             facts.append("Class reminders go out 30 minutes before each meeting.")
@@ -92,7 +92,7 @@ async def process_chat(user_id, text: str) -> Draft | None:
         else:
             facts.append("Reminders go out 3 days, 1 day and 3 hours before.")
         break
-    facts.append("If it's for a course with teammates he's told you about, you can mention them.")
+    facts.append("If it's for a course with teammates the user has told you about, you can mention them.")
     return Draft(" ".join(facts), kind="schedule")
 
 

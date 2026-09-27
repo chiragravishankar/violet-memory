@@ -100,6 +100,18 @@ def bootstrap() -> None:
     _db.commit()
 
 
+def fill_names(name_of) -> int:
+    """Give users without a name the one from their profile (name_of: user_id -> name or None)."""
+    n = 0
+    for r in _db.execute("SELECT telegram_id FROM users WHERE name IS NULL OR name = ''").fetchall():
+        name = name_of(r[0])
+        if name:
+            _db.execute("UPDATE users SET name = ? WHERE telegram_id = ?", (name, r[0]))
+            n += 1
+    _db.commit()
+    return n
+
+
 def get(user_id) -> dict | None:
     r = _db.execute("SELECT * FROM users WHERE telegram_id = ?", (str(user_id),)).fetchone()
     return dict(r) if r else None

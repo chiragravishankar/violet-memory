@@ -3,6 +3,7 @@ writes short lines (the day's tone, a tip, one memory line per class or meeting,
 priorities). Layout comes from fmt.py. No channel code here."""
 
 import asyncio
+import time as time_mod
 import json
 import logging
 import re
@@ -14,6 +15,7 @@ from pathlib import Path
 import brain
 import events
 import fmt
+import people
 import llm
 import paths
 import schedule
@@ -112,7 +114,7 @@ class BriefData:
     agenda: list[Entry]  # today's classes, meetings, events
     due_soon: list[Entry]  # deadlines today + next 3 days (LockDown ones marked)
     exams: list[Entry]  # next 7 days
-    follow_ups: list[Entry]
+    follow_ups: list[dict]  # follow-up records due within 2 days (or overdue)
     pick: object | None  # events.Scored
     profile: str
     notes: dict = field(default_factory=dict)  # id(entry) -> calendar facts for the memory line
@@ -125,7 +127,7 @@ def gather(user_id, day: date, now: datetime) -> BriefData:
     soon = schedule.agenda_entries(user_id, day, day + timedelta(days=3), as_of, schedule.DEADLINE_KINDS)
     due_soon = [e for e in soon if e.kind == "deadline" and not _FOLLOW_UP.search(e.title)]
     exams = [e for e in schedule.agenda_entries(user_id, day, day + timedelta(days=6), as_of, {"exam"})]
-    follow_ups = [e for e in ents if e.kind == "deadline" and _FOLLOW_UP.search(e.title)]
+    follow_ups = people.open_followups(user_id, days=2)
     pick = None
     for s in events.picks_for_day(user_id, day, demo=True):
         if s.score >= PICK_MIN and not s.conflicts:
@@ -143,17 +145,50 @@ def gather(user_id, day: date, now: datetime) -> BriefData:
     return data
 
 
-async def _memory(user_id, e: Entry) -> str:
-    q = (f"Who's in my {e.course or e.title} class or group, what's due next for it, and what did I note about it?"
-         if e.kind == "class" else f"What do I know about {e.title}: who's involved, what I promised, what it's for?")
-    try:
+PREPARE_AHEAD = timedelta(minutes=15)  # wake memory and fetch the brief's context this long before sending
+PREPARE_WAIT = 90.0  # seconds each prefetch may take (a cold workspace can need most of a minute)
+_prepared: dict[tuple[str, str], dict[str, str]] = {}  # (user, day) -> {question: memory context}
+
+
+def _memory_question(e: Entry) -> str:
+    return (f"Who's in my {e.course or e.title} class or group, what's due next for it, and what did I note about it?"
+            if e.kind == "class" else f"What do I know about {e.title}: who's involved, what I promised, what it's for?")
+
+
+async def prepare(user_id, day: date, now: datetime | None = None) -> dict:
+    """Ahead of the brief: wake the memory workspace and fetch each agenda item's memory context in the
+    background, so the brief itself never waits on a cold start. Returns what was prepared, with timing."""
+    now = now or datetime.now(TZ)
+    t = time_mod.monotonic()
+    key = (str(user_id), day.isoformat())
+    _prepared.setdefault(key, {})  # marks it as being prepared, so the loop starts it only once
+    brain.touch("brief in 15 minutes")
+    d = gather(user_id, day, now)
+    qs = [_memory_question(e) for e in d.agenda]
+    texts = await asyncio.gather(*(brain.context_for(user_id, q, wait=PREPARE_WAIT) for q in qs))
+    _prepared[key] = {q: (x or "")[:1200] for q, x in zip(qs, texts)}
+    info = {"items": len(qs), "with_memory": sum(1 for x in texts if x), "seconds": round(time_mod.monotonic() - t, 1)}
+    log.info("brief for %s on %s prepared: %s", user_id, day, info)
+    return info
+
+
+def prepared(user_id, day: date) -> bool:
+    return (str(user_id), day.isoformat()) in _prepared
+
+
+async def _memory(user_id, e: Entry, day: date | None = None) -> str:
+    q = _memory_question(e)
+    ready = _prepared.get((str(user_id), day.isoformat())) if day else None
+    if ready is not None and q in ready:
+        return ready[q]
+    try:  # not prepared (e.g. /brief on demand): a short lookup, and the brief goes out without it if slow
         return (await brain.context_for(user_id, q, wait=MEMORY_TIMEOUT))[:1200]
     except (asyncio.TimeoutError, Exception) as ex:
         log.info("memory lookup skipped (%s)", type(ex).__name__)
         return ""
 
 
-LINES_TASK = """Write the short lines for his {what}. Return JSON only.
+LINES_TASK = """Write the short lines for their {what}. Return JSON only.
 
 Date: {date}
 Today's agenda:
@@ -164,14 +199,14 @@ Exams this week: {exams}
 Return {{"tone": "2 to 3 words for the day, like Busy day, Light day, Exam week, Big day",
 "tip": "one concrete tip for {when} in under 20 words that names a specific item and when to do it (not a general reminder to focus)",
 "context": {{"<n>": "one short line (max 12 words) for agenda item n that adds something NOT already in
-its title or place: who's involved, what's due for that course, what he promised someone. Only facts
+its title or place: who's involved, what's due for that course, what the user promised someone. Only facts
 from its notes. Never restate the title, never generic advice. Empty string if there's nothing new."}}{prio}}}"""
 
 
 async def _lines(user_id, what: str, when: str, day: date, agenda_items: list[tuple[str, str]],
                  deadlines: str, exams: str, extra: str = "", priorities: bool = False) -> dict:
     agenda = "\n".join(f"{n}. {line}\n   notes: {notes or 'none'}" for n, (line, notes) in enumerate(agenda_items, 1)) or "(nothing)"
-    prio = ',\n"priorities": ["three short priorities for the week (max 12 words each), from the deadlines, exams and his goals"]' if priorities else ""
+    prio = ',\n"priorities": ["three short priorities for the week (max 12 words each), from the deadlines, exams and their goals"]' if priorities else ""
     task = LINES_TASK.format(what=what, when=when, date=f"{day:%A %b} {day.day}", agenda=agenda,
                              deadlines=deadlines or "none", exams=exams or "none", extra=extra, prio=prio)
     try:
@@ -210,13 +245,14 @@ def _entry_text(e: Entry) -> str:
 async def daily(user_id, day: date, now: datetime | None = None) -> View:
     now = now or datetime.now(TZ)
     d = gather(user_id, day, now)
-    memories = await asyncio.gather(*(_memory(user_id, e) for e in d.agenda)) if d.agenda else []
+    memories = await asyncio.gather(*(_memory(user_id, e, day) for e in d.agenda)) if d.agenda else []
+    _prepared.pop((str(user_id), day.isoformat()), None)
     items = [(_entry_text(e), "; ".join(d.notes[id(e)] + ([m] if m else []))[:1500]) for e, m in zip(d.agenda, memories)]
     lines = await _lines(
         user_id, "morning brief", "today", day, items,
         "; ".join(f"{e.title} ({e.course}) {e.day:%a} {e.time_text}" + (" [LockDown]" if e.note else "") for e in d.due_soon),
         "; ".join(f"{e.title} {e.day:%a} {e.time_text}" for e in d.exams),
-        extra=f"Event worth his time: {d.pick.event.title}, {events.when(d.pick.event)}" if d.pick else "",
+        extra=f"Event worth their time: {d.pick.event.title}, {events.when(d.pick.event)}" if d.pick else "",
     )
     today = day
     greet = f"☀️ Good morning, {esc(d.name)}"
@@ -234,7 +270,13 @@ async def daily(user_id, day: date, now: datetime | None = None) -> View:
         agenda_lines += views.entry_lines(e, today, lines["context"].get(n))
     due_lines = [views.deadline_bullet(e, today, compact=True)[0] for e in d.due_soon]
     exam_lines = [views.deadline_bullet(e, today, compact=True)[0] for e in d.exams]
-    fu_lines = [fmt.bullet(f"{esc(fmt.short_title(e.title))} · <b>{esc(e.time_text)}</b>", "person") for e in d.follow_ups]
+    fu_lines = [fmt.bullet(f"{esc(f['person'])}: {esc(fmt.short_title(f['promise']))} · <b>{people._due_text(f)}</b>", "person")
+                for f in d.follow_ups]
+    # The morning after an event: who did they meet? Asked once per event.
+    checkin = None
+    if day == datetime.now(TZ).date():
+        checkin = next((c for c in people.checkin_candidates(user_id, day) if people.ask_checkin(user_id, c)), None)
+    checkin_lines = [f"Who'd you meet at <b>{esc(checkin['title'])}</b> yesterday?"] if checkin else []
     pick_lines = views.event_lines(d.pick, today) if d.pick else []
     import inbox
 
@@ -244,7 +286,7 @@ async def daily(user_id, day: date, now: datetime | None = None) -> View:
         # Light day: greeting, the one or two items, the tip.
         body = agenda_lines + due_lines + exam_lines + fu_lines + pick_lines
         text = fmt.join(f"{greet}\n{sub_head}", "\n".join(body) if body else "Nothing on your calendar today.",
-                        fmt.section("📬 <b>INBOX</b>", inbox_lines), tip)
+                        fmt.section("📬 <b>INBOX</b>", inbox_lines), fmt.section("👋 <b>CHECK-IN</b>", checkin_lines), tip)
     else:
         text = fmt.join(
             f"{greet}\n{sub_head}",
@@ -254,11 +296,14 @@ async def daily(user_id, day: date, now: datetime | None = None) -> View:
             fmt.section(fmt.header("person", "Follow ups"), fu_lines),
             fmt.section("📬 <b>INBOX</b>", inbox_lines),
             fmt.section(fmt.header("event", "Worth your time"), pick_lines),
+            fmt.section("👋 <b>CHECK-IN</b>", checkin_lines),
             tip,
         )
     buttons = list(views.BRIEF_BUTTONS)
     if d.pick:
         buttons = views.event_buttons([d.pick]) + buttons
+    if checkin:
+        buttons = [people.checkin_buttons(checkin["key"])] + buttons
     v = fmt.view(text, buttons, max_lines=BRIEF_MAX_LINES)
     v.pick = d.pick  # so the sender can mark it suggested
     return v
@@ -283,7 +328,7 @@ async def weekly(user_id, now: datetime | None = None) -> View:
         user_id, "weekly preview", "the week", start, [(f"{e.day:%a} {_entry_text(e)}", "") for e in ents if e.kind not in ("deadline", "exam")][:25],
         "; ".join(f"{e.title} ({e.course}) {e.day:%a} {e.time_text}" + (" [LockDown]" if e.note else "") for e in deadlines if e.kind == "deadline"),
         "; ".join(f"{e.title} {e.day:%a} {e.time_text}" for e in deadlines if e.kind == "exam"),
-        extra=f"His goals: {selfmodel.profile_summary(user_id, max_words=80)}", priorities=True,
+        extra=f"Their goals: {selfmodel.profile_summary(user_id, max_words=80)}", priorities=True,
     )
     # Day-by-day highlights, compact: at most 2 per day (exams and deadlines first), only days with
     # something, no blank lines between days so the whole preview stays under 25 lines.

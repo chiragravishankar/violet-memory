@@ -21,38 +21,38 @@ log = logging.getLogger("assistant")
 QUESTION, SCHEDULE, MEMORY, CORRECTION = "question", "schedule", "memory", "correction"
 FALLBACK = "Hmm, I couldn't pull that up just now. Try me again in a sec?"
 
-CLASSIFY_TASK = """Classify his message, and if it is a "memory", also write your reply to it.
+CLASSIFY_TASK = """Classify their message, and if it is a "memory", also write your reply to it.
 
 Types:
-- "question": he wants information back. Includes questions without a question mark and
+- "question": the user wants information back. Includes questions without a question mark and
   commands like "show me tuesday", "who is hena", "what work do i have next week", "list my exams".
-- "schedule": he's telling you about something with a date or time to track: a deadline,
+- "schedule": the user is telling you about something with a date or time to track: a deadline,
   exam, class, meeting or event ("marketing draft due next Friday 11:59pm", "stats exam on Oct 12").
 - "memory": a fact, person, idea or note to keep with nothing to schedule
   ("Met Dana at the design mixer, she builds climate tools").
-- "correction": he's correcting something about himself or something you said:
+- "correction": the user is correcting something about themselves or something you said:
   "I am X", "my name is X", "actually ...", "no, ...", "that's wrong, ...", "bro, i am chirag".
 
 If unsure between question and memory, choose question.
-about_schedule: the message is about his schedule (deadlines, classes, events, days, what is due).
-about_user: a question about himself or his own life (his name, who he is, what he studies, his
-courses, projects, goals, the people in his life, his preferences).
+about_schedule: the message is about their schedule (deadlines, classes, events, days, what is due).
+about_user: a question about themselves or their own life (their name, who the user is, what the user studies, their
+courses, projects, goals, the people in their life, their preferences).
 ack: only for "memory": your reply acknowledging the specific thing, in your voice, 1 or 2 short
 sentences, sometimes with one helpful beat. Empty string otherwise.
 
 Return JSON: {{"type": "question|schedule|memory|correction", "about_schedule": true|false, "about_user": true|false, "ack": "..."}}
 
-His message: \"\"\"{text}\"\"\""""
+Their message: \"\"\"{text}\"\"\""""
 
-ADVICE_TASK = """He asked: "{question}"
+ADVICE_TASK = """The user asked: "{question}"
 
-Give him 3 to 5 concrete priorities, one per line (numbering is fine here). Hard deadlines first, in
+Give them 3 to 5 concrete priorities, one per line (numbering is fine here). Hard deadlines first, in
 date order, each with its day and time (group several into one line if it reads better). Then tie
-the rest to his goals and projects by name, and mention a teammate or mentor if relevant.
+the rest to their goals and projects by name, and mention a teammate or mentor if relevant.
 Every hard deadline below must appear. Only use dates and times from the agenda; don't invent
 times for goal work.
 
-His agenda from {start} to {end}:
+Their agenda from {start} to {end}:
 {agenda}
 
 Hard deadlines in that period:
@@ -60,24 +60,24 @@ Hard deadlines in that period:
 
 Other things you know that may help: {context}"""
 
-ABOUT_USER_TASK = """He asked about himself: "{question}"
+ABOUT_USER_TASK = """The user asked about themselves: "{question}"
 
-What he has told you about himself (this is the truth about him):
+What the user has told you about themselves (this is the truth about them):
 {profile}
 
 Other things you know (can mix people up; if they conflict with the above, the above wins, and
 any other name in them is someone else):
 {context}
 
-Answer him. If you don't know, say so and ask."""
+Answer them. If you don't know, say so and ask."""
 
-MEMORY_TASK = """He asked: "{question}"
+MEMORY_TASK = """The user asked: "{question}"
 
-What you know that's relevant (from things he told you, files he sent and his calendars; names
-other than his are other people):
+What you know that's relevant (from things the user told you, files the user sent and their calendars; names
+other than their are other people):
 {context}
 
-Answer him. If you don't know, say so plainly and ask for the missing piece."""
+Answer them. If you don't know, say so plainly and ask for the missing piece."""
 
 _ADVICE = re.compile(r"\b(focus|prioriti[sz]e|priorities|plan my|should i|what should|where should|how should|advice)\b", re.I)
 _SCHEDULE_WORDS = re.compile(
@@ -152,7 +152,7 @@ async def _context(user_id, question: str, limit: int = 2500) -> str:
 async def answer(user_id, question: str, about_schedule: bool, now: datetime | None = None,
                  about_user: bool = False, recent: list[str] | None = None) -> "str | View":
     """Answer a question in Violet's voice: schedule questions from the same agenda as /week
-    (plus graph context), questions about him from his profile first, others from the graph."""
+    (plus graph context), questions about them from their profile first, others from the graph."""
     now = now or datetime.now(TZ)
     try:
         return await _answer(user_id, question, about_schedule, now, about_user, recent)
@@ -213,7 +213,7 @@ async def correct(user_id, text: str, last_reply: str | None = None, recent: lis
         name = " ".join(w[:1].upper() + w[1:] for w in m.group(1).split())
         selfmodel.set_identity(user_id, name=name)
         await brain.correct(user_id, f"My name is {name}.", "what my name is")
-        draft = f"Fixed his name: he is {name}. Own the mistake briefly."
+        draft = f"Fixed their name: the user is {name}. Own the mistake briefly."
     else:
         instruction = text if not last_reply else f'You had just said: "{last_reply[:300]}". The user replied: "{text}"'
         changes = await selfmodel.edit(user_id, instruction)
@@ -270,7 +270,7 @@ def is_event_question(text: str) -> bool:
     return bool(_EVENT_WORDS.search(text))
 
 
-LEAD_TASK = """Write ONE short lead-in line (max 8 words) for his morning event picks. It's {today}.
+LEAD_TASK = """Write ONE short lead-in line (max 8 words) for their morning event picks. It's {today}.
 There {count} ({days}). Like "A couple worth your time this week." or "One worth grabbing a spot for."
 Match the count and the days. No emoji, no event names."""
 
@@ -287,12 +287,12 @@ async def picks_message(user_id, picks, at: datetime, recent: list[str] | None =
     return views.events_view(picks, at, lead=lead)
 
 
-EVENTS_PICK_TASK = """He asked: "{question}"
+EVENTS_PICK_TASK = """The user asked: "{question}"
 
 Candidate events (NYU Events and Luma) from {start} to {end}, best matches first:
 {facts}
 
-Pick the ones that answer his question (for example, career events, AI hackathons, or what's at a
+Pick the ones that answer their question (for example, career events, AI hackathons, or what's at a
 place), at most 5, best first. Return JSON: {{"ids": ["..."], "lead": "one short line (max 10 words)"}}.
 If none fit, return an empty list and a lead that says so plainly."""
 

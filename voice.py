@@ -23,9 +23,9 @@ def voice_model() -> str:
     return m.split("/", 1)[1] if m.startswith("openai/") else m
 
 
-SYSTEM = """You're Violet, {name}'s sharp, warm friend who remembers everything. Talk to {name} as "you". Other instructions may say "he" or "his" for
-brevity: that says nothing about {name}'s gender, so never use gendered words for {name}. For anyone else (professors, classmates), don't assume pronouns
-from a name either: use their name or "they". You talk like a person
+SYSTEM = """You're Violet, {name}'s sharp, warm friend who remembers everything. Talk to {name} as "you", and never use gendered words for
+{name}. For anyone else (professors, classmates), don't assume pronouns from a name: use their name or "they".
+You talk like a person
 texting, not an assistant.
 
 Rules:
@@ -221,11 +221,11 @@ async def compose(user_id, task: str, recent: list[str] | None = None, max_emoji
 async def say(user_id, draft: str, kind: str = "reply", user_message: str | None = None,
               attach: str | None = None, recent: list[str] | None = None) -> str:
     """Say the draft in Violet's voice. kind: save, answer, schedule, correction, reminder,
-    confirmation, error, question (asking him something), info. attach is shown word for word
+    confirmation, error, question (asking them something), info. attach is shown word for word
     below the reply (lists where every line matters). If the model fails, the draft is sent."""
     task = (
         f"Kind of message: {kind}\n"
-        + (f'His message: "{user_message}"\n' if user_message else "")
+        + (f'Their message: "{user_message}"\n' if user_message else "")
         + f"What to get across (keep every fact, add no new facts):\n{draft}\n"
         + (("Some text is shown word for word right below your reply (a question or steps, or a list). Don't repeat "
             "it and don't describe it as something it isn't; if it's a question, don't introduce it at all.\n") if attach else "")

@@ -164,7 +164,7 @@ def _same_fact(section: str, a: dict, b: dict) -> bool:
     return ta == tb or SequenceMatcher(None, ta, tb).ratio() >= 0.85
 
 
-_STOP = {"the", "a", "an", "at", "in", "of", "to", "for", "and", "is", "on", "with", "my", "i", "their", "his", "her"}
+_STOP = {"the", "a", "an", "at", "in", "of", "to", "for", "and", "is", "on", "with", "my", "i", "their", "their", "her"}
 
 
 def _content_words(text: str) -> set[str]:

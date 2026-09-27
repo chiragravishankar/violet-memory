@@ -23,6 +23,7 @@ import agent
 import assistant
 import brain  # loads .env
 import brief
+import delivered
 import docs
 import events
 import feeds
@@ -31,6 +32,7 @@ import inbox
 import ingest
 import onboarding
 import paths
+import people
 import schedule
 import selfmodel
 import speech
@@ -54,6 +56,7 @@ COMMANDS = (
     "/undo  remove what your last file added\n"
     "/me  what I know about you (/me setup, /me edit, /me reflect)\n"
     "/forget <text>  make me forget something\n"
+    "/people  who you've met, by where · /followups  what you promised people\n"
     "/connect  add your Brightspace and Google calendars (/connect status)\n"
     "/connect_google  let me add calendar events and write emails (always with your OK)\n"
     "/actions  what I've done or offered to do\n"
@@ -334,7 +337,7 @@ async def _send_after_delay(bot, chat_id: int, action_id: str) -> None:
 
 
 async def act_on_card(bot, chat_id: int, user_id, action_id: str, op: str, via: str, card_message=None) -> None:
-    """His decision on a card: do / send / draft / cancel / undo."""
+    """Their decision on a card: do / send / draft / cancel / undo."""
     if op == "undo":
         o = await actions.undo(user_id, action_id)
         await _send_outcome(bot, chat_id, action_id, o)
@@ -523,6 +526,18 @@ async def usage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply(update, f"Usage {day or 'today'} (UTC):\n" + "\n".join(lines))
 
 
+async def people_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/people: who you've met, grouped by where, newest first."""
+    log_message("in", update, inbound_text(update))
+    await send_view(context.bot, update.effective_chat.id, people.people_view(update.effective_user.id))
+
+
+async def followups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/followups: open follow-ups with Done / Snooze / Draft."""
+    log_message("in", update, inbound_text(update))
+    await send_view(context.bot, update.effective_chat.id, people.followups_view(update.effective_user.id))
+
+
 async def connect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/connect: add calendars. /connect status, /connect remove brightspace|google."""
     log_message("in", update, inbound_text(update))
@@ -572,7 +587,7 @@ async def _paste_feed(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("in", update, inbound_text(update))
-    await speak(update, "First hello. You're Violet: he can text or voice-note you anything to keep (people he "
+    await speak(update, "First hello. You're Violet: the user can text or voice-note you anything to keep (people the user "
                         "meets, events, ideas, deadlines), ask you anything about it, and send files like a syllabus. "
                         "Two short sentences.", kind="info")
 
@@ -879,8 +894,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
 
     # Everything else: the conversational agent decides what he wants and which tools to use.
     set_classification(rows, "agent")
+    ci = people.telling(user_id)
+    said = (f"(Answering your check-in: who I met at {ci['title']} on {ci['event_date']}. Save each person with "
+            f"add_person and any promises with add_followup.) {text}") if ci else text
     try:
-        r = await _with_typing(update, context, agent.respond(user_id, text))
+        r = await _with_typing(update, context, agent.respond(user_id, said))
+        if ci:
+            people.answer_checkin(user_id, ci["event_key"], "told")
     except Exception:
         log.exception("agent failed")
         await reply(update, "Sorry, my head's a bit foggy right now. Try me again in a moment?")
@@ -947,7 +967,7 @@ async def _event_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     chosen, cands = events.resolve(user_id, ref)
     if not chosen:
         names = "; ".join(f"{n}. {e.title} ({events.when(e)})" for n, e in enumerate(cands, 1))
-        await speak(update, f"Not sure which event he means. Ask which one, by name or number: {names}",
+        await speak(update, f"Not sure which event the user means. Ask which one, by name or number: {names}",
                     kind="question", user_message=text)
         return
     drafts = [await events.act(user_id, action, e) for e in chosen]
@@ -985,21 +1005,21 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 resp.raise_for_status()
                 n = len(luma.parse(resp.content, now))
         except Exception as e:
-            await speak(update, f"Couldn't read that Luma feed ({type(e).__name__}). Ask him to check the link.",
+            await speak(update, f"Couldn't read that Luma feed ({type(e).__name__}). Ask them to check the link.",
                         kind="error", user_message=said)
             return
         _add_env_list("LUMA_ICS_URLS", url)
         report = await _with_typing(update, context, events.refresh(now))
         scored = await _with_typing(update, context, events.score_new(user_id, now))
         await speak(update, f"Added the Luma feed ({n} upcoming events in it). Refreshed everything and scored "
-                            f"{scored} new events for him.", kind="confirmation", user_message=said)
+                            f"{scored} new events for them.", kind="confirmation", user_message=said)
         return
     if sub == "refresh":
         report = await _with_typing(update, context, events.refresh(now))
         scored = await _with_typing(update, context, events.score_new(user_id, now))
         got = "; ".join(f"{k}: {v.get('fetched', 0)} upcoming, {v.get('new', 0)} new" if "error" not in v
                         else f"{k}: failed ({v['error']})" for k, v in report.items())
-        await speak(update, f"Refreshed the event feeds. {got}. Scored {scored} new ones for him.",
+        await speak(update, f"Refreshed the event feeds. {got}. Scored {scored} new ones for them.",
                     kind="confirmation", user_message=said)
         return
     await send_view(context.bot, update.effective_chat.id, _events_view(user_id, sub == "all", now))
@@ -1143,6 +1163,31 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         row = _db.execute("SELECT text FROM voice_transcripts WHERE token = ? AND user_id = ?", (data[3:], user_id)).fetchone()
         text = f"📝 <b>TRANSCRIPT</b>\n\n<i>{fmt.esc(row[0])}</i>" if row else "That transcript isn't around anymore."
         await send_view(context.bot, update.effective_chat.id, View(text))
+    elif data.startswith("fu:"):
+        _, op, fid = data.split(":", 2)
+        f = people.get(user_id, int(fid)) if fid.isdigit() else None
+        if f is None:
+            await reply(update, "I can't find that follow-up anymore.")
+        elif op == "done":
+            people.done(user_id, f["id"])
+            await reply(update, f"✅ Done: {f['person']}, {f['promise']}. Noted that you were in touch today.")
+        elif op == "snooze":
+            g = people.snooze(user_id, f["id"], 2)
+            await reply(update, f"⏰ I'll bring up {f['person']} again {g['due_date']}.")
+        elif op == "draft":
+            r = await agent.respond(user_id, f"Draft a short message for my follow-up with {f['person']}: {f['promise']}. "
+                                             "Use what you know about them. If you don't have their email address, ask me for it.")
+            await _send_agent_reply(update, context, r)
+    elif data.startswith("ci:"):
+        _, op, key = data.split(":", 2)
+        c = people.answer_checkin(user_id, key, {"tell": "telling", "no": "didnt_go", "none": "nobody_new"}.get(op, "asked"))
+        if c is None:
+            await reply(update, "That check-in isn't open anymore.")
+        elif op == "tell":
+            await reply(update, f"Go ahead: who did you meet at {c['title']}? Names, what they do, anything you promised "
+                                "them. Text or a voice note.")
+        else:
+            await reply(update, "Got it, skipping that one." if op == "no" else "Okay, nobody new. 👍")
     elif data.startswith("more:"):
         chat, pages = _more_pages.get(data[5:], (None, None))
         if chat != update.effective_chat.id:
@@ -1200,12 +1245,12 @@ async def _reflection_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return "Thanks for answering."
     outcome, fact = selfmodel.answer_question(user_id, text)
     if outcome == "confirmed":
-        head = "He confirmed it; you'll treat it as a fact now."
+        head = "The user confirmed it; you'll treat it as a fact now."
     elif outcome == "deleted":
-        head = "He said no; you dropped it."
+        head = "The user said no; you dropped it."
     else:
         changes = await _with_typing(update, context, selfmodel.edit(user_id, f'About "{q["question"]}": {text}'))
-        head = ("Updated: " + "; ".join(changes)) if changes else "Took his answer on board."
+        head = ("Updated: " + "; ".join(changes)) if changes else "Took their answer on board."
     context.application.create_task(sync_profile(user_id))
     nxt = selfmodel.next_question(user_id)
     if nxt:
@@ -1230,7 +1275,7 @@ async def me_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         kind="confirmation", user_message=said)
         else:
             selfmodel.set_meta(user_id, awaiting_edit=True)
-            await speak(update, "Ask what he wants changed about him, with an example like: my career goal is "
+            await speak(update, "Ask what the user wants changed about them, with an example like: my career goal is "
                                 "product management, not consulting.", kind="question", user_message=said)
     elif sub == "reflect":
         draft, attach = await _with_typing(update, context, run_reflection(user_id))
@@ -1238,10 +1283,10 @@ async def me_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         shown = selfmodel.format_profile(user_id)
         if not shown:
-            await speak(update, "You don't know much about him yet. Suggest /me setup for a few quick questions.",
+            await speak(update, "You don't know much about them yet. Suggest /me setup for a few quick questions.",
                         kind="info", user_message=said)
         else:
-            await speak(update, "Here's everything you know about him (below). Lead in with a few words; mention "
+            await speak(update, "Here's everything you know about them (below). Lead in with a few words; mention "
                                 "/me edit to fix anything.", kind="info", user_message=said,
                         attach=shown.split("\n", 2)[-1].strip())
 
@@ -1260,7 +1305,7 @@ async def forget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await speak(update, f'Found nothing about "{text}" to forget.', kind="confirmation", user_message=f"/forget {text}")
         return
     what = [f["text"] for f in removed]
-    extra = f" Also dropped {memories} message{'s' if memories != 1 else ''} he'd sent that mentioned it." if memories else ""
+    extra = f" Also dropped {memories} message{'s' if memories != 1 else ''} the user had sent that mentioned it." if memories else ""
     await speak(update, f'Forgot what you knew about "{text}": {"; ".join(what) or "nothing else"}.{extra}',
                 kind="confirmation", user_message=f"/forget {text}")
 
@@ -1283,7 +1328,7 @@ async def run_reflection(user_id) -> tuple[str, str | None]:
     questions = await selfmodel.reflect(user_id, _recent_messages(user_id), agenda)
     asyncio.get_running_loop().create_task(sync_profile(user_id))
     patterns = [f["text"] for f in selfmodel.get_profile(user_id)["patterns"]][-4:]
-    draft = "Weekly check-in: you looked back at his week."
+    draft = "Weekly check-in: you looked back at their week."
     draft += " Patterns you noticed are listed below." if patterns else " Nothing new stood out."
     if questions:
         selfmodel.set_meta(user_id, awaiting_answer=True)
@@ -1315,8 +1360,12 @@ async def demo_time(user_id, at: datetime) -> list:
             v = await assistant.picks_message(user_id, picks, at, recent_replies(user_id))
             events.record_picks(user_id, at.date(), picks, v.plain, demo=True)
             out.append(v)
-    for it, lead in schedule.preview_reminders(user_id, at):
+    new, already = schedule.fire_demo_reminders(user_id, at)
+    for it, lead in new:
         out.append(await assistant.reminder_message(user_id, it, lead, at, recent_replies(user_id)))
+    if already:
+        out.append(f"{already} reminder{'s' if already != 1 else ''} for that moment already went out, so I didn't send "
+                   f"{'them' if already != 1 else 'it'} again.")
     if len(out) == 1:
         out.append("Nothing would go out at that moment.")
     return out
@@ -1335,7 +1384,7 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not ext and (msg.document.mime_type or "").startswith("image/"):
             file_name += "." + msg.document.mime_type.split("/")[1]
         if ext == ".doc":
-            await speak(update, "Can't read old .doc files. Ask him to save it as .docx and resend.", kind="error",
+            await speak(update, "Can't read old .doc files. Ask them to save it as .docx and resend.", kind="error",
                         user_message=inbound_text(update))
             return
         if not docs.is_supported(file_name):
@@ -1366,7 +1415,7 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await f.download_to_drive(path)
     except Exception:
         log.exception("download failed")
-        await speak(update, "Couldn't download that file. Ask him to try again.", kind="error",
+        await speak(update, "Couldn't download that file. Ask them to try again.", kind="error",
                     user_message=inbound_text(update))
         return
 
@@ -1375,7 +1424,7 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         draft = await _with_typing(update, context, ingest.process_file(user_id, path, file_name, caption))
     except Exception:
         log.exception("file processing failed")
-        await speak(update, "Couldn't read that file. Ask him to try again.", kind="error", user_message=inbound_text(update))
+        await speak(update, "Couldn't read that file. Ask them to try again.", kind="error", user_message=inbound_text(update))
         return
     await speak(update, draft.text, kind=draft.kind, user_message=inbound_text(update), attach=draft.attach)
     context.application.create_task(brain.connect(user_id), update=update)
@@ -1395,7 +1444,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if duration > transcribe.MAX_SECONDS:
         log_message("in", update, f"[voice {duration}s, too long]")
-        await speak(update, f"That note is {duration // 60} minutes long; you can take up to 5. Ask him for a "
+        await speak(update, f"That note is {duration // 60} minutes long; you can take up to 5. Ask them for a "
                             "shorter one or to split it.", kind="error")
         return
     await update.effective_chat.send_action(ChatAction.TYPING)
@@ -1463,6 +1512,11 @@ async def send_reminders(app: Application) -> None:
                 users.acting.set(str(user_id))
                 v = await assistant.reminder_message(user_id, item, lead, now, recent_replies(user_id))
                 await send_view(app.bot, int(user_id), v)
+            for user_id in users.active_ids():
+                if selfmodel.quiet_until(user_id, now):
+                    continue
+                for f in people.due_reminders(user_id, now):
+                    await send_view(app.bot, int(user_id), people.reminder_view(f))
         except Exception:
             log.exception("reminder loop error")
         await asyncio.sleep(30)
@@ -1490,6 +1544,8 @@ async def profile_loop(app: Application) -> None:
         if now.weekday() == 6 and now.hour >= 18:
             for user_id in users.active_ids():
                 if selfmodel.meta(user_id).get("last_reflection") == now.date().isoformat():
+                    continue
+                if not delivered.claim(user_id, "reflection", now.date().isoformat()):
                     continue
                 try:
                     draft, attach = await run_reflection(user_id)
@@ -1519,7 +1575,8 @@ async def email_loop(app: Application) -> None:
                 if inbox.due(user_id):
                     started = datetime.now(timezone.utc).isoformat()
                     rep = await inbox.sync(user_id)
-                    if rep.first and not rep.error:
+                    if rep.first and not rep.error and not selfmodel.meta(user_id).get("inbox_announced"):
+                        selfmodel.set_meta(user_id, inbox_announced=True)  # once, even if first syncs repeat
                         await send_view(app.bot, int(user_id), View(
                             f"📬 <b>INBOX CONNECTED</b>\n↳ Read the last {inbox.FIRST_SYNC_DAYS} days: {rep.fetched} emails, "
                             f"{rep.skipped} skipped (promotions, social, newsletters), {rep.classified} sorted.\n"
@@ -1544,7 +1601,7 @@ async def email_loop(app: Application) -> None:
 
 
 async def _after_sync(app: Application, user_id, since: str, first: bool) -> None:
-    """New mail: deadlines and changes onto the schedule (telling him), calendar cards for new ones,
+    """New mail: deadlines and changes onto the schedule (telling them), calendar cards for new ones,
     and important facts into memory."""
     rows = inbox._db.execute("SELECT id FROM emails WHERE user_id = ? AND classified_at >= ? AND mine = 0", (str(user_id), since)).fetchall()
     cards, suggested = 0, 0
@@ -1600,6 +1657,8 @@ async def events_loop(app: Application) -> None:
                 for user_id in event_users():
                     if events.picked_today(user_id, now.date()) or selfmodel.quiet_until(user_id, now):
                         continue
+                    if not delivered.claim(user_id, "event_picks", now.date().isoformat()):
+                        continue
                     users.acting.set(user_id)
                     picks = events.picks_for_day(user_id, now.date())
                     v = await assistant.picks_message(user_id, picks, now, recent_replies(user_id)) if picks else None
@@ -1620,10 +1679,13 @@ async def brief_loop(app: Application) -> None:
         for user_id in event_users():
             users.acting.set(user_id)
             try:
+                soon = now + brief.PREPARE_AHEAD
+                if brief.due(user_id, soon) == "daily" and not brief.due(user_id, now) and not brief.prepared(user_id, soon.date()):
+                    app.create_task(brief.prepare(user_id, soon.date(), now))  # wake memory and fetch context early
                 kind = brief.due(user_id, now)
-                if kind == "daily":
+                if kind == "daily" and delivered.claim(user_id, "brief", now.date().isoformat()):
                     await _deliver_brief(app.bot, user_id, now.date(), await brief.daily(user_id, now.date(), now))
-                elif kind == "weekly":
+                elif kind == "weekly" and delivered.claim(user_id, "weekly_preview", now.date().isoformat()):
                     v = await brief.weekly(user_id, now)
                     await send_view(app.bot, int(user_id), v)
                     brief.mark_sent(user_id, now.date(), "weekly", v.plain)
@@ -1669,6 +1731,14 @@ async def warm_loop(app: Application) -> None:
 
 async def post_init(app: Application) -> None:
     users.bootstrap()
+    users.fill_names(selfmodel.owner_name)
+    for uid in users.active_ids():
+        try:
+            moved = await people.migrate(uid)
+            if moved:
+                log.info("moved %d follow-up item(s) into follow-up records for %s", len(moved), uid)
+        except Exception as e:
+            log.warning("follow-up migration failed (%s)", type(e).__name__)
     await brain.start()  # Cognee Cloud: connect on this loop before any memory operation
     n = actions.expire_stale_sends()  # a send cut off by a restart never goes out late
     if n:
@@ -1688,7 +1758,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await speak(update, "Something went wrong on your side. Ask him to try again.", kind="error")
+            await speak(update, "Something went wrong on your side. Ask them to try again.", kind="error")
         except Exception:
             pass
 
@@ -1705,6 +1775,8 @@ def build_app(token: str, bot=None) -> Application:
     app.add_handler(TypeHandler(Update, gate), group=-1)  # access control before everything else
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("connect", connect_cmd))
+    app.add_handler(CommandHandler("people", people_cmd))
+    app.add_handler(CommandHandler("followups", followups_cmd))
     app.add_handler(CommandHandler("invite", invite_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("block", block_cmd))

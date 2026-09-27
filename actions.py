@@ -183,7 +183,7 @@ def validate(user_id, type_: str, p: dict) -> dict:
     # email
     to = str(p.get("to_email") or "").strip()
     if not _EMAIL.match(to):
-        raise Refused("I need his or her real email address first. What is it?")
+        raise Refused("I need their or her real email address first. What is it?")
     if not email_known(user_id, to):
         raise Refused(f"I won't use {to} unless you give it to me. What's the right address?")
     if _SUBMISSION_HOSTS.search(to) or _COURSEWORK.search(f"{p.get('subject', '')} {p.get('body', '')}"):
@@ -520,7 +520,7 @@ def save_contact_email(user_id, name: str, email: str) -> str:
 
 
 def save_contact_email_trusted(user_id, name: str, email: str) -> None:
-    """Save an address that came from his own mail (a sender or recipient), on the person's entry if known."""
+    """Save an address that came from their own mail (a sender or recipient), on the person's entry if known."""
     data = selfmodel.get_profile(user_id)
     for f in data["people"]:
         if name and name.split()[0].lower() in f["text"].lower():
@@ -540,7 +540,7 @@ def person_email(user_id, name: str) -> str | None:
 
 EDIT_TASK = """Update this {kind} per the user's change. Keep everything else as is. Return the full
 updated JSON object only (same keys). Times are ISO 8601 in America/New_York. No em dashes.
-For emails keep his style: casual, short, value-first, signed Chirag.
+For emails keep their style: casual, short, value-first, signed Chirag.
 
 Current: {payload}
 Change: "{change}" """
@@ -563,7 +563,7 @@ async def edit(user_id, action_id: str, change: str) -> Action:
 
 
 def calendar_from_event(e) -> dict:
-    """From a discovered event (NYU Events, Luma) he's going to."""
+    """From a discovered event (NYU Events, Luma) the user is going to."""
     import events
 
     return {"title": e.title, "start": e.start.isoformat(), "end": e.end.isoformat() if e.end and not e.all_day else None,
@@ -572,7 +572,7 @@ def calendar_from_event(e) -> dict:
 
 
 def calendar_from_item(it: schedule.Item) -> dict:
-    """From a deadline, exam or event he added by chat."""
+    """From a deadline, exam or event the user added by chat."""
     kind = "exam" if it.kind == "exam" else ("event" if it.kind == "event" else "deadline")
     if it.due_time and kind != "event":
         start = datetime.combine(it.due_date, it.due_time, tzinfo=TZ) - timedelta(minutes=30)

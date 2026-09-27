@@ -301,6 +301,25 @@ async def main():
         bad = True
     check("a dataset name can't be forged from a user id", bad)
 
+    # ---------- people loop ----------
+    import people
+    fa = people.add_followup(A, "Keith Mauppa", "send the credits proposal (A-Secret)", now.date().isoformat())
+    people.add_person(A, "Zed Nightjar", "investor", "A-Secret context", met_at="Leslie mixer", field="fintech")
+    people._db.execute("INSERT INTO checkins (user_id, event_key, title, event_date, status, asked_at) VALUES (?,?,?,?,?,?)",
+                       (A, "event:test:e1", "Founders Dinner", now.date().isoformat(), "asked", now.isoformat()))
+    people._db.commit()
+    out = []
+    for data in [f"fu:done:{fa}", f"fu:snooze:{fa}", f"fu:draft:{fa}", "ci:tell:event:test:e1"]:
+        out += await chat.tap(B, data, name="Maya")
+    out += await chat.send(B, "/people", name="Maya")
+    out += await chat.send(B, "/followups", name="Maya")
+    out += await chat.send(B, "who do I know in fintech?", name="Maya")
+    check("B's people and follow-ups show none of A's", not leaks([m["text"] for m in out], A_MARK + ["Zed", "Mauppa"]),
+          str(leaks([m["text"] for m in out], A_MARK + ["Zed", "Mauppa"])))
+    check("B can't close or snooze A's follow-up", people.get(A, fa)["status"] == "open")
+    check("B can't answer A's check-in", people._db.execute(
+        "SELECT status FROM checkins WHERE user_id = ? AND event_key = 'event:test:e1'", (A,)).fetchone()[0] == "asked")
+
     # ---------- secrets and shared knowledge ----------
     before = calls["agent"]
     out = await chat.send(B, "my netid password is Hunter22!", name="Maya")
