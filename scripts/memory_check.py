@@ -42,12 +42,18 @@ async def main(roundtrip: bool, rounds: int, show: bool) -> None:
 
     if roundtrip:
         token = uuid.uuid4().hex[:6]
-        fact = f"The Violet self-test code word is heron-{token}."
+        fact = f"Violet self-test {token} used the answer word heron."
         await brain.save("selftest", fact)
         _, took = await timed(brain.connect("selftest"))
         print(f"remember (dataset user_selftest): {took:.1f}s, queued left {brain.queued('selftest') if brain.CLOUD else 0}")
-        ans, took = await timed(brain.recall_raw("selftest", "What is the Violet self-test code word?", wait=120))
-        print(f"recall: {took:.1f}s, round trip {'OK' if token in ans else 'MISSED'}")
+        t0 = time.monotonic()
+        while True:  # remember() returns before the server finishes the graph
+            ans, took = await timed(brain.recall_raw("selftest", f"What answer word did Violet self-test {token} use?", wait=120))
+            if "heron" in ans.lower() or time.monotonic() - t0 > 180:
+                break
+            await asyncio.sleep(5)
+        print(f"recall: {took:.1f}s (graph ready after {time.monotonic() - t0:.0f}s), "
+              f"round trip {'OK' if 'heron' in ans.lower() else 'MISSED'}")
 
     times = []
     for r in range(rounds):
@@ -56,6 +62,8 @@ async def main(roundtrip: bool, rounds: int, show: bool) -> None:
             times.append(took)
             print(f"  round {r + 1} {q!r}: {took:.2f}s, {'found' if ctx else 'empty'}"
                   + (f"\n    {ctx[:300]!r}" if show else ""))
+    if not times:
+        return
     print(f"recall latency ({brain.MODE}): median {statistics.median(times):.2f}s, "
           f"min {min(times):.2f}s, max {max(times):.2f}s over {len(times)} calls")
 

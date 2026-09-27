@@ -409,6 +409,10 @@ async def _cloud_recall(user_id, question: str, wait: float, **kw) -> str:
         if "(404)" in str(e):  # no dataset yet for this user: nothing to find
             _ok()
             return ""
+        if "(409)" in str(e):  # the server is still building the graph from a recent remember()
+            _ok()
+            log.info("memory: %s is still being processed, answering without it for now", ds)
+            return ""
         _slow()
         log.warning("memory: recall for %s failed (%s)", ds, _safe(e))
         return ""
@@ -440,6 +444,15 @@ async def recall_raw(user_id: int | str, question: str, system_prompt: str | Non
     return _first_text(results)
 
 
+def _tidy(text: str) -> str:
+    """Cloud context comes as a node dump; drop the markers and empty file-name nodes."""
+    import re
+
+    text = text.replace("__node_content_start__\n", "").replace("\n__node_content_end__", "")
+    text = re.sub(r"Node: text_[0-9a-f]{32}\nNone\n*", "", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def _first_text(results) -> str:
     """Pull a plain text answer out of Cognee search or recall results."""
     for r in results or []:
@@ -454,7 +467,7 @@ def _first_text(results) -> str:
             value = next((v for v in value if v), "")
         if isinstance(value, dict):
             value = value.get("answer") or value.get("text") or value.get("content") or ""
-        text = str(value).strip() if value else ""
+        text = _tidy(str(value)) if value else ""
         if text:
             return text.replace("—", ", ").replace("**", "")
     return ""
